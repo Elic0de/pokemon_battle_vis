@@ -13,6 +13,7 @@ runs/
 uploads/
 replays/jobs/
 agents/*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*/
+.cache/
 
 # Frontend
 node_modules/

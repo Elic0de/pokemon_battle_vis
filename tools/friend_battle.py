@@ -13,6 +13,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,12 +25,14 @@ from cg.game import battle_finish, battle_select, battle_start, visualize_data  
 AgentFn = Callable[[dict[str, Any]], list[int]]
 
 
-@dataclass(frozen=True)
+@dataclass
 class LoadedAgent:
     name: str
     path: Path
     agent_fn: AgentFn
     deck: list[int]
+    local_module_roots: set[str]
+    local_modules: dict[str, ModuleType]
 
 
 @contextmanager
@@ -51,6 +54,38 @@ def read_deck(path: Path) -> list[int]:
     return deck
 
 
+def local_module_roots(agent_dir: Path) -> set[str]:
+    roots = {path.stem for path in agent_dir.glob("*.py") if path.name != "main.py"}
+    roots.update(path.name for path in agent_dir.iterdir() if path.is_dir() and (path / "__init__.py").is_file())
+    # cg is the shared native game engine. Reloading per agent reinitializes its
+    # global buffers; only submission-owned helper packages are isolated.
+    roots.discard("cg")
+    return roots
+
+
+def matching_modules(roots: set[str]) -> dict[str, ModuleType]:
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if module is not None and name.split(".", 1)[0] in roots
+    }
+
+
+@contextmanager
+def agent_module_scope(agent: LoadedAgent):
+    saved = matching_modules(agent.local_module_roots)
+    for name in saved:
+        sys.modules.pop(name, None)
+    sys.modules.update(agent.local_modules)
+    try:
+        yield
+    finally:
+        agent.local_modules = matching_modules(agent.local_module_roots)
+        for name in list(agent.local_modules):
+            sys.modules.pop(name, None)
+        sys.modules.update(saved)
+
+
 def load_agent(agent_dir: Path, name: str) -> LoadedAgent:
     agent_dir = agent_dir.resolve()
     main_path = agent_dir / "main.py"
@@ -64,23 +99,40 @@ def load_agent(agent_dir: Path, name: str) -> LoadedAgent:
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {main_path}")
     module = importlib.util.module_from_spec(spec)
+    roots = local_module_roots(agent_dir)
+    saved_modules = matching_modules(roots)
+    for module_name_to_remove in saved_modules:
+        sys.modules.pop(module_name_to_remove, None)
     old_path = list(sys.path)
     sys.path.insert(0, str(agent_dir))
+    loaded_modules: dict[str, ModuleType] = {}
     try:
         with pushd(agent_dir):
             spec.loader.exec_module(module)
+        loaded_modules = matching_modules(roots)
     finally:
         sys.path[:] = old_path
+        for module_name_to_remove in matching_modules(roots):
+            sys.modules.pop(module_name_to_remove, None)
+        sys.modules.update(saved_modules)
 
     fn = getattr(module, "agent", None)
     if not callable(fn):
         raise AttributeError(f"{main_path} must define callable agent(obs)")
-    return LoadedAgent(name=name, path=agent_dir, agent_fn=fn, deck=read_deck(agent_dir))
+    return LoadedAgent(
+        name=name,
+        path=agent_dir,
+        agent_fn=fn,
+        deck=read_deck(agent_dir),
+        local_module_roots=roots,
+        local_modules=loaded_modules,
+    )
 
 
 def safe_call_agent(agent: LoadedAgent, obs: dict[str, Any]) -> list[int]:
-    with pushd(agent.path):
-        action = agent.agent_fn(obs)
+    with agent_module_scope(agent):
+        with pushd(agent.path):
+            action = agent.agent_fn(obs)
     if not isinstance(action, list) or not all(isinstance(i, int) for i in action):
         raise ValueError(f"{agent.name}.agent(obs) returned non-list[int]: {action!r}")
     return action
@@ -188,13 +240,18 @@ def main() -> int:
     wins = {0: 0, 1: 0, 2: 0}
     rows: list[dict[str, Any]] = []
     start_ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    run_started_perf = time.perf_counter()
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     keep_vis = not args.no_visualize_data
 
     for game_idx in range(args.games):
         seat_swapped = bool(args.swap and game_idx % 2 == 1)
         left, right = (a1, a0) if seat_swapped else (a0, a1)
+        game_started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+        game_started_perf = time.perf_counter()
         row = play_one(left, right, args.max_steps, keep_vis)
+        game_finished_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+        game_duration_seconds = time.perf_counter() - game_started_perf
         raw_result = row["result"]
         # Normalize result back to original --agent0/--agent1 names.
         if raw_result in (0, 1) and seat_swapped:
@@ -210,7 +267,9 @@ def main() -> int:
         row.update({
             "run_id": run_id,
             "game": game_idx,
-            "started_at": start_ts,
+            "started_at": game_started_at,
+            "finished_at": game_finished_at,
+            "duration_seconds": round(game_duration_seconds, 3),
             "seat_swapped": seat_swapped,
             "first_player_raw": raw_first_player,
             "first_player": norm_first_player,
@@ -230,6 +289,8 @@ def main() -> int:
     summary = {
         "run_id": run_id,
         "started_at": start_ts,
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "duration_seconds": round(time.perf_counter() - run_started_perf, 3),
         "agent0": str(a0.path),
         "agent1": str(a1.path),
         "agent0_name": Path(args.agent0).name or "agent0",

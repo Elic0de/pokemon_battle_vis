@@ -10,6 +10,7 @@ export default defineConfig(() => ({
     proxy: {
       "/api": process.env.VITE_API_TARGET || "http://127.0.0.1:5000",
     },
+    allowedHosts: [".ngrok-free.app"]
   },
   resolve: {
     alias: {

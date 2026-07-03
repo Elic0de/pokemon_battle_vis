@@ -12,6 +12,7 @@ venv/
 runs/
 uploads/
 replays/jobs/
+replays/browser/
 agents/*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*/
 .cache/
 

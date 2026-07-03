@@ -30,6 +30,7 @@ import {
   RefreshCw,
   RotateCcw,
   Settings,
+  Swords,
   Trash2,
   TriangleAlert,
   Trophy,
@@ -277,13 +278,69 @@ type DeckEntry = {
   created_at?: string
 }
 
-type CardCatalogEntry = { id: number; name: string; image_url: string }
+type CardCatalogEntry = { id: number; name: string; category?: string; image_url: string }
+
+type BattleCard = { id: number; serial: number; playerIndex: number }
+type BattlePokemon = BattleCard & { hp: number; maxHp: number; energies?: number[]; energyCards?: BattleCard[]; tools?: BattleCard[] }
+type BattlePlayer = {
+  active: Array<BattlePokemon | null>
+  bench: BattlePokemon[]
+  benchMax?: number
+  deckCount: number
+  discard: BattleCard[]
+  prize: Array<BattleCard | null>
+  handCount: number
+  hand: BattleCard[] | null
+  poisoned?: boolean
+  burned?: boolean
+  asleep?: boolean
+  paralyzed?: boolean
+  confused?: boolean
+}
+type BattleCurrent = {
+  turn?: number
+  firstPlayer?: number
+  supporterPlayed?: boolean
+  stadiumPlayed?: boolean
+  energyAttached?: boolean
+  retreated?: boolean
+  stadium?: BattleCard[]
+  looking?: Array<BattleCard | null> | null
+  players?: BattlePlayer[]
+}
+type BattleSelect = {
+  type?: string | number
+  context?: string | number
+  minCount?: number
+  maxCount?: number
+  option?: Array<Record<string, unknown>>
+  deck?: BattleCard[] | null
+  contextCard?: BattleCard | null
+  effect?: BattleCard | null
+}
+
+type BrowserBattle = {
+  session_id: string
+  opponent: { id: string; name: string }
+  deck_id: string
+  your_turn: boolean
+  result: number
+  current: BattleCurrent
+  select: BattleSelect
+  logs: Array<Record<string, unknown>>
+  action_count: number
+  revision: number
+  visualizer_url: string
+  error?: string | null
+}
+type BrowserMatch = { id: string; opponent_name: string; deck_id: string; status: string; result: number; action_count: number; started_at: string; finished_at: string; replay_url: string; visualizer_url: string }
 
 type Page =
   | { name: "dashboard" }
   | { name: "ranking" }
   | { name: "agents" }
   | { name: "decks" }
+  | { name: "play" }
   | { name: "agent"; id: string }
   | { name: "jobs" }
   | { name: "job"; id: string }
@@ -296,6 +353,7 @@ const navItems = [
   { path: "/ranking", label: "ランキング", icon: Trophy },
   { path: "/agents", label: "Agents", icon: Bot },
   { path: "/decks", label: "デッキ", icon: Library },
+  { path: "/play", label: "AIと対戦", icon: Swords },
   { path: "/jobs", label: "Jobs", icon: Activity },
   { path: "/runs", label: "試合履歴", icon: History },
   { path: "/management", label: "シーズン管理", icon: Settings },
@@ -319,6 +377,7 @@ function parsePage(pathname: string): Page {
   if (parts[0] === "agents" && parts[1]) return { name: "agent", id: decodeURIComponent(parts[1]) }
   if (parts[0] === "agents") return { name: "agents" }
   if (parts[0] === "decks") return { name: "decks" }
+  if (parts[0] === "play") return { name: "play" }
   if (parts[0] === "jobs" && parts[1]) return { name: "job", id: parts[1] }
   if (parts[0] === "jobs") return { name: "jobs" }
   if (parts[0] === "runs" && parts[1]) return { name: "run", id: parts[1] }
@@ -1066,6 +1125,333 @@ function DecksPage() {
   )
 }
 
+function browserOptionLabel(option: Record<string, unknown>, index: number) {
+  const type = option.type
+  if (type === "Yes") return "はい"
+  if (type === "No") return "いいえ"
+  const optionType = Number(type)
+  if (optionType === 0) return `${String(option.number ?? index)}枚`
+  if (optionType === 1) return "はい"
+  if (optionType === 2) return "いいえ"
+  if (optionType === 7) return "手札から使う"
+  if (optionType === 8) return "カードをつける"
+  if (optionType === 9) return "進化する"
+  if (optionType === 10) return "特性を使う"
+  if (optionType === 11) return "トラッシュする"
+  if (optionType === 12) return "にげる"
+  if (optionType === 13) return String(option.attackName || `ワザ ${String(option.attackId ?? "")}`)
+  if (optionType === 14) return "番を終わる"
+  return `選択肢 ${index + 1}`
+}
+
+const contextLabels: Record<number, string> = {
+  0: "行動を選んでください", 1: "最初のバトルポケモンを選んでください", 2: "ベンチに出すポケモンを選んでください",
+  3: "入れ替えるポケモンを選んでください", 4: "バトル場に出すポケモンを選んでください", 7: "手札に加えるカードを選んでください",
+  8: "トラッシュするカードを選んでください", 13: "ダメカンを置くポケモンを選んでください", 17: "回復するポケモンを選んでください",
+  18: "進化元を選んでください", 21: "カードをつけるポケモンを選んでください", 22: "つけるカードを選んでください",
+  25: "効果の対象を選んでください", 26: "トラッシュするエネルギーを選んでください", 35: "使うワザを選んでください",
+  38: "枚数を選んでください", 41: "先攻を選びますか？", 42: "引き直しますか？", 43: "効果を使いますか？", 46: "オモテを選びますか？",
+}
+
+function cardForOption(option: Record<string, unknown>, battle: BrowserBattle): BattleCard | BattlePokemon | null {
+  const type = Number(option.type)
+  const area = Number(option.area)
+  const index = Number(option.index)
+  const playerIndex = Number(option.playerIndex ?? 0)
+  const player = battle.current.players?.[playerIndex]
+  if (type === 7 || type === 8 || type === 9) return battle.current.players?.[0]?.hand?.[index] || null
+  if (type === 13) return battle.current.players?.[0]?.active?.[0] || null
+  if (type === 3 && area === 1) return battle.select.deck?.[index] || null
+  if (type === 3 && area === 12) return battle.current.looking?.[index] || null
+  if (!player) return null
+  if (area === 2) return player.hand?.[index] || null
+  if (area === 3) return player.discard[index] || null
+  if (area === 4) return player.active[index] || null
+  if (area === 5) return player.bench[index] || null
+  if (area === 6) return player.prize[index] || null
+  if (area === 7) return battle.current.stadium?.[index] || null
+  return null
+}
+
+function targetForOption(option: Record<string, unknown>, battle: BrowserBattle) {
+  const area = Number(option.inPlayArea)
+  const index = Number(option.inPlayIndex)
+  const player = battle.current.players?.[Number(option.playerIndex ?? 0)]
+  if (area === 4) return player?.active[index] || null
+  if (area === 5) return player?.bench[index] || null
+  return null
+}
+
+function optionMatchesCard(option: Record<string, unknown>, card: BattleCard, area: number, index: number) {
+  const type = Number(option.type)
+  if ((type === 7 || type === 8 || type === 9) && area === 2) return Number(option.index) === index
+  return Number(option.area) === area && Number(option.index) === index && Number(option.playerIndex ?? card.playerIndex) === card.playerIndex
+}
+
+function BattleCardView({ card, catalog, label, selected, selectable, compact, fluid, onClick, onPreview }: { card: BattleCard | BattlePokemon | null; catalog: Map<number, CardCatalogEntry>; label?: string; selected?: boolean; selectable?: boolean; compact?: boolean; fluid?: boolean; onClick?: () => void; onPreview?: (card: BattleCard | null) => void }) {
+  const data = card ? catalog.get(card.id) : null
+  const pokemon = card && "hp" in card ? card as BattlePokemon : null
+  const energyCounts = (pokemon?.energies || []).reduce<Record<number, number>>((counts, energy) => {
+    counts[energy] = (counts[energy] || 0) + 1
+    return counts
+  }, {})
+  const energyStyle: Record<number, { label: string; className: string }> = {
+    0: { label: "無", className: "bg-stone-200 text-stone-900" }, 1: { label: "草", className: "bg-emerald-500 text-white" },
+    2: { label: "炎", className: "bg-red-500 text-white" }, 3: { label: "水", className: "bg-blue-500 text-white" },
+    4: { label: "雷", className: "bg-yellow-300 text-yellow-950" }, 5: { label: "超", className: "bg-fuchsia-500 text-white" },
+    6: { label: "闘", className: "bg-orange-700 text-white" }, 7: { label: "悪", className: "bg-slate-800 text-white" },
+    8: { label: "鋼", className: "bg-slate-400 text-slate-950" }, 9: { label: "竜", className: "bg-amber-500 text-stone-950" },
+    10: { label: "虹", className: "bg-gradient-to-r from-red-400 via-yellow-300 to-blue-500 text-stone-950" }, 11: { label: "R", className: "bg-rose-950 text-white" },
+  }
+  return <button type="button" aria-disabled={!selectable} onClick={selectable ? onClick : undefined} onMouseEnter={() => onPreview?.(card)} onMouseLeave={() => onPreview?.(null)} className={`group relative shrink-0 overflow-hidden rounded-lg border-2 bg-stone-800 text-left shadow-sm transition ${fluid ? "w-full" : compact ? "w-[min(8vh,6.25rem)]" : "w-[min(9.5vh,7.75rem)]"} ${selected ? "-translate-y-1 border-amber-300 ring-4 ring-amber-300/50" : selectable ? "cursor-pointer border-sky-300 hover:-translate-y-1 hover:border-sky-100 hover:ring-4 hover:ring-sky-300/40" : "cursor-default border-white/15"}`}>
+    <div className="aspect-[5/7] bg-stone-700">{card ? <img draggable={false} src={data?.image_url || `/api/cards/${card.id}/image?lang=ja`} alt={data?.name || `カード ${card.id}`} className="h-full w-full object-contain" /> : <div className="grid h-full place-items-center text-3xl text-white/25">?</div>}</div>
+    {label ? <div className="absolute inset-x-0 bottom-0 truncate bg-black/75 px-1.5 py-1 text-center text-[10px] font-bold text-white">{label}</div> : null}
+    {pokemon ? <div className="absolute top-1 right-1 rounded bg-rose-600 px-1.5 py-0.5 text-[10px] font-bold text-white">{pokemon.hp}/{pokemon.maxHp}</div> : null}
+    {Object.keys(energyCounts).length ? <div className="absolute top-1 left-1 grid gap-0.5">{Object.entries(energyCounts).map(([energy, count]) => { const style = energyStyle[Number(energy)] || { label: `E${energy}`, className: "bg-white text-stone-900" }; return <span key={energy} className={`rounded px-1 py-0.5 text-[9px] font-black leading-none shadow ${style.className}`}>{style.label}×{count}</span> })}</div> : pokemon?.energyCards?.length ? <div className="absolute top-1 left-1 rounded bg-amber-300 px-1 text-[9px] font-bold text-stone-900">E×{pokemon.energyCards.length}</div> : null}
+  </button>
+}
+
+function CardBackStack({ count, label }: { count: number; label: string }) {
+  return <div className="grid w-16 shrink-0 place-items-center rounded-lg border-2 border-white/20 bg-gradient-to-br from-sky-800 to-indigo-950 p-2 text-center text-white shadow-md sm:w-20"><div className="text-2xl font-black">{count}</div><div className="text-[10px] text-white/70">{label}</div></div>
+}
+
+function PrizeCards({ count }: { count: number }) {
+  return <div className="grid justify-items-end gap-1"><div className="flex gap-1">{Array.from({ length: count }, (_, index) => <div key={index} className="aspect-[5/7] w-[clamp(1.4rem,3.5vh,2.2rem)] rounded border border-white/40 bg-gradient-to-br from-sky-700 to-indigo-950 shadow" />)}</div><span className="text-[10px] text-white/70">サイド {count}</span></div>
+}
+
+function battleLogText(log: Record<string, unknown>, catalog: Map<number, CardCatalogEntry>, opponentName: string) {
+  const type = Number(log.type)
+  const actor = Number(log.playerIndex) === 0 ? "あなた" : opponentName
+  const cardName = (key = "cardId") => {
+    const id = Number(log[key])
+    return Number.isFinite(id) && id > 0 ? catalog.get(id)?.name || `カード ${id}` : "カード"
+  }
+  if (type === 2) return `${actor}の番`
+  if (type === 3) return `${actor}が番を終えた`
+  if (type === 4) return `${actor}が${cardName()}を引いた`
+  if (type === 5) return `${actor}がカードを引いた`
+  if (type === 8) return `${actor}が${cardName("cardIdBench")}と入れ替えた`
+  if (type === 9) return `${cardName("cardIdBefore")}が${cardName("cardIdAfter")}になった`
+  if (type === 10) return `${actor}が${cardName()}を使った`
+  if (type === 11) return `${actor}が${cardName()}を${cardName("cardIdTarget")}につけた`
+  if (type === 12) return `${actor}が${cardName("cardIdTarget")}を${cardName()}へ進化させた`
+  if (type === 13) return `${actor}が${cardName("cardIdTarget")}を退化させた`
+  if (type === 15) return `${actor}の${cardName()}がワザを使った`
+  if (type === 16) return `${cardName()}のHPが${Number(log.value) > 0 ? "+" : ""}${String(log.value ?? 0)}`
+  if (type === 17) return `${cardName()}${log.isRecover ? "のどくが治った" : "はどくになった"}`
+  if (type === 18) return `${cardName()}${log.isRecover ? "のやけどが治った" : "はやけどになった"}`
+  if (type === 19) return `${cardName()}${log.isRecover ? "は目を覚ました" : "はねむりになった"}`
+  if (type === 20) return `${cardName()}${log.isRecover ? "のマヒが治った" : "はマヒになった"}`
+  if (type === 21) return `${cardName()}${log.isRecover ? "のこんらんが治った" : "はこんらんした"}`
+  if (type === 22) return `コインは${log.head ? "オモテ" : "ウラ"}`
+  if (type === 23) return Number(log.result) === 0 ? "あなたの勝ち" : Number(log.result) === 1 ? `${opponentName}の勝ち` : "引き分け"
+  return null
+}
+
+function BrowserBattlePage() {
+  const [agents, setAgents] = useState<Agent[]>([])
+  const [decks, setDecks] = useState<DeckEntry[]>([])
+  const [catalog, setCatalog] = useState<CardCatalogEntry[]>([])
+  const [history, setHistory] = useState<BrowserMatch[]>([])
+  const [opponentId, setOpponentId] = useState("")
+  const [deckId, setDeckId] = useState("")
+  const [battle, setBattle] = useState<BrowserBattle | null>(null)
+  const [selected, setSelected] = useState<number[]>([])
+  const [dragged, setDragged] = useState<{ card: BattleCard; area: number; index: number } | null>(null)
+  const [previewCard, setPreviewCard] = useState<BattleCard | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    Promise.all([
+      api<{ ready_agents: Agent[] }>("/api/agents"),
+      api<{ decks: DeckEntry[] }>("/api/decks"),
+      api<{ cards: CardCatalogEntry[] }>("/api/cards?lang=ja"),
+      api<{ matches: BrowserMatch[] }>("/api/play/history?limit=20"),
+    ]).then(([agentData, deckData, cardData, historyData]) => {
+      setAgents(agentData.ready_agents)
+      setDecks(deckData.decks)
+      setCatalog(cardData.cards)
+      setHistory(historyData.matches)
+      setOpponentId((current) => current || agentData.ready_agents[0]?.id || "")
+      setDeckId((current) => current || deckData.decks[0]?.id || "")
+    })
+  }, [])
+
+  const options = battle?.select.option || []
+  const minCount = Number(battle?.select.minCount ?? 1)
+  const maxCount = Number(battle?.select.maxCount ?? 1)
+  const cardsById = useMemo(() => new Map(catalog.map((card) => [card.id, card])), [catalog])
+
+  async function startBattle() {
+    setBusy(true)
+    try {
+      const data = await api<{ battle: BrowserBattle }>("/api/play/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ opponent_agent_id: opponentId, deck_id: deckId }),
+      })
+      setBattle(data.battle)
+      setSelected([])
+      toast.success("対戦を開始しました", { description: `vs ${data.battle.opponent.name}` })
+    } catch (error) {
+      toast.error("対戦を開始できませんでした", { description: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function toggleOption(index: number) {
+    setSelected((current) => {
+      if (current.includes(index)) return current.filter((value) => value !== index)
+      if (maxCount <= 1) return [index]
+      return current.length < maxCount ? [...current, index] : current
+    })
+  }
+
+  function chooseOption(index: number) {
+    if (minCount === 1 && maxCount === 1) {
+      void submitAction([index])
+      return
+    }
+    toggleOption(index)
+  }
+
+  function selectBoardCard(card: BattleCard, area: number, index: number) {
+    if (!battle) return
+    const matches = options.map((option, optionIndex) => optionMatchesCard(option, card, area, index) ? optionIndex : -1).filter((value) => value >= 0)
+    if (matches.length === 1) chooseOption(matches[0])
+    else if (matches.length > 1) {
+      const ability = matches.find((optionIndex) => Number(options[optionIndex].type) === 10)
+      if (ability != null) chooseOption(ability)
+      else document.getElementById("battle-actions")?.scrollIntoView({ behavior: "smooth", block: "nearest" })
+    }
+  }
+
+  function dropOption(targetArea: number, targetIndex: number) {
+    if (!dragged || !battle) return null
+    const category = cardsById.get(dragged.card.id)?.category || ""
+    const context = Number(battle.select.context)
+    const matches = options.map((option, optionIndex) => {
+      if (!optionMatchesCard(option, dragged.card, dragged.area, dragged.index)) return -1
+      const type = Number(option.type)
+      if (option.inPlayArea != null) return Number(option.inPlayArea) === targetArea && Number(option.inPlayIndex) === targetIndex ? optionIndex : -1
+      if (type === 3 && context === 1) return targetArea === 4 ? optionIndex : -1
+      if (type === 3 && context === 2) return targetArea === 5 ? optionIndex : -1
+      if (type === 7 && category.includes("ポケモン/たね")) return targetArea === 5 ? optionIndex : -1
+      if (type === 7 && category.includes("スタジアム")) return targetArea === 7 ? optionIndex : -1
+      return -1
+    }).filter((value) => value >= 0)
+    return matches.length === 1 ? matches[0] : null
+  }
+
+  function dropCard(targetArea: number, targetIndex: number) {
+    const option = dropOption(targetArea, targetIndex)
+    setDragged(null)
+    if (option != null) chooseOption(option)
+  }
+
+  async function submitAction(actionOverride?: number[]) {
+    if (!battle) return
+    setBusy(true)
+    try {
+      const data = await api<{ battle: BrowserBattle }>("/api/play/select", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: battle.session_id, action: actionOverride ?? selected }),
+      })
+      setBattle(data.battle)
+      setSelected([])
+    } catch (error) {
+      toast.error("その操作を実行できませんでした", { description: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function finishBattle() {
+    if (battle) await api("/api/play/finish", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: battle.session_id }) })
+    setBattle(null)
+    setSelected([])
+    api<{ matches: BrowserMatch[] }>("/api/play/history?limit=20").then((data) => setHistory(data.matches))
+  }
+
+  if (!battle) return (
+    <div className="mx-auto grid max-w-3xl gap-5">
+      <section className="rounded-lg border bg-background p-5"><h1 className="flex items-center gap-2 text-xl font-bold"><Swords />AIと対戦</h1><p className="mt-1 text-sm text-muted-foreground">自分のデッキと登録済みAgentを選び、ブラウザからカード操作を選択します。同時に遊べる対戦は1つです。</p></section>
+      <Panel title="対戦設定">
+        <div className="grid gap-4">
+          <Field label="対戦相手Agent"><select className="h-10 rounded-md border bg-background px-3" value={opponentId} onChange={(event) => setOpponentId(event.target.value)}>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}（Elo {agent.elo.toFixed(1)}）</option>)}</select></Field>
+          <Field label="自分のデッキ"><select className="h-10 rounded-md border bg-background px-3" value={deckId} onChange={(event) => setDeckId(event.target.value)}>{decks.map((deck) => <option key={deck.id} value={deck.id}>{deck.kind === "agent" ? "[Agent]" : "[作成済み]"} {deck.name}</option>)}</select></Field>
+          <Button className="w-full" disabled={busy || !opponentId || !deckId} onClick={() => void startBattle()}>{busy ? <RefreshCw className="animate-spin" /> : <Swords />}対戦開始</Button>
+        </div>
+      </Panel>
+      <Panel title="試合履歴">
+        <div className="grid gap-2">{history.length ? history.map((match) => <div key={match.id} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border p-3 text-sm"><div><div className="font-medium">vs {match.opponent_name}</div><div className="text-xs text-muted-foreground">{dateTimeLabel(match.finished_at)}・操作 {match.action_count}回・{match.status === "cancelled" ? "キャンセル" : match.result === 0 ? "勝ち" : match.result === 1 ? "負け" : "引き分け"}</div></div><div className="flex gap-2"><LinkButton href={match.visualizer_url} external>Visualizer</LinkButton><LinkButton href={`${match.replay_url}?download=1`}><Download />Replay JSON</LinkButton></div></div>) : <div className="py-5 text-center text-sm text-muted-foreground">試合履歴はありません</div>}</div>
+      </Panel>
+    </div>
+  )
+
+  const resultLabel = battle.result === 0 ? "あなたの勝ち" : battle.result === 1 ? `${battle.opponent.name}の勝ち` : battle.result >= 0 ? "引き分け" : "対戦中"
+  const you = battle.current.players?.[0]
+  const opponent = battle.current.players?.[1]
+  const contextText = contextLabels[Number(battle.select.context)] || "カードまたは操作を選んでください"
+  const isSelectable = (card: BattleCard, area: number, index: number) => options.some((option) => optionMatchesCard(option, card, area, index))
+  const isSearch = Boolean(battle.select.deck && options.some((option) => Number(option.area) === 1))
+  const fieldActionChoices = options.map((option, index) => ({ option, index })).filter(({ option }) => [12, 13, 14].includes(Number(option.type)))
+  const actionChoices = options.map((option, index) => ({ option, index })).filter(({ option }) => {
+    const source = cardForOption(option, battle)
+    return ![10, 12, 13, 14].includes(Number(option.type)) && (isSearch || !source || source.playerIndex !== 0 || !you?.hand?.some((card) => card.serial === source.serial))
+  })
+  const visibleLogs = battle.logs.map((log) => battleLogText(log, cardsById, battle.opponent.name)).filter((text): text is string => Boolean(text)).slice(-6)
+  return (
+    <div className="grid h-[calc(100svh-7rem)] min-h-0 grid-rows-[auto_minmax(0,1fr)] gap-2 overflow-hidden">
+      <header className="flex flex-wrap items-center justify-between gap-2 rounded-xl border bg-background px-3 py-2 shadow-sm">
+        <div><h1 className="flex items-center gap-2 font-bold"><Swords className="text-rose-600" />あなた vs {battle.opponent.name}</h1><div className="mt-0.5 text-xs text-muted-foreground">ターン {battle.current.turn ?? 0}・操作 {battle.action_count}回・{resultLabel}</div></div>
+        <div className="flex gap-2"><DeckPreviewButton agentId={battle.opponent.id} agentName={battle.opponent.name} label="相手デッキ" /><Button variant="destructive" size="sm" onClick={() => void finishBattle()}>{battle.result < 0 ? "対戦をキャンセル" : "対戦終了"}</Button></div>
+      </header>
+
+      <div className="relative min-h-0 overflow-hidden">
+      <section className="relative h-full min-h-0 overflow-hidden rounded-2xl border-4 border-emerald-950/50 bg-[radial-gradient(circle_at_center,_#277c62_0%,_#145842_55%,_#0b392d_100%)] p-2 text-white shadow-xl">
+        <div className="pointer-events-none absolute inset-x-0 top-1/2 border-t-2 border-dashed border-white/15" />
+        {visibleLogs.length ? <div className="pointer-events-none absolute top-16 right-2 z-10 grid w-[min(20rem,42%)] gap-0.5 rounded-lg bg-black/65 p-2 text-[11px] shadow-lg backdrop-blur-sm">{visibleLogs.map((text, index) => <div key={`${battle.revision}-${index}`} className={index === visibleLogs.length - 1 ? "font-bold text-amber-200" : "text-white/70"}>{text}</div>)}</div> : null}
+        <div className="relative grid h-full min-h-0 grid-rows-[1fr_auto_1fr] gap-1">
+          <div className="grid content-start gap-3">
+            <div className="flex items-start justify-between gap-3">
+              <div><div className="text-sm font-bold">{battle.opponent.name}</div><div className="text-xs text-white/60">手札 {opponent?.handCount ?? 0}枚</div></div>
+              <div className="flex items-start gap-3"><PrizeCards count={opponent?.prize?.length ?? 0} /><CardBackStack count={opponent?.deckCount ?? 0} label="山札" /></div>
+            </div>
+            <div className="flex min-h-0 w-full items-center justify-center gap-1 px-2 sm:px-16">{opponent?.bench?.length ? opponent.bench.map((card) => <div key={card.serial} className="w-[min(8vh,calc((100%_-_1rem)/5))] max-w-[6.25rem] min-w-0"><BattleCardView fluid card={card} catalog={cardsById} onPreview={setPreviewCard} /></div>) : <div className="text-xs text-white/30">相手ベンチ</div>}</div>
+            <div className="flex justify-center">{opponent?.active?.[0] ? <BattleCardView card={opponent.active[0]} catalog={cardsById} onPreview={setPreviewCard} /> : <div className="grid h-28 w-20 place-items-center rounded-lg border-2 border-dashed border-white/20 text-xs text-white/30">バトル場</div>}</div>
+          </div>
+
+          <div onDragOver={(event) => { if (dropOption(7, 0) != null) event.preventDefault() }} onDrop={(event) => { event.preventDefault(); dropCard(7, 0) }} className={`relative flex h-12 items-center justify-end gap-3 rounded-xl px-2 sm:px-8 ${dropOption(7, 0) != null ? "bg-sky-300/20 ring-2 ring-sky-300" : ""}`}><div className="absolute top-1/2 left-2 z-10 -translate-y-1/2 sm:left-8">{battle.current.stadium?.[0] ? <BattleCardView compact card={battle.current.stadium[0]} catalog={cardsById} onPreview={setPreviewCard} /> : <div className="rounded-full border border-white/15 bg-black/10 px-4 py-1 text-[10px] text-white/35">STADIUM</div>}</div><div className="pointer-events-auto flex flex-wrap justify-end gap-2">{fieldActionChoices.map(({ option, index }) => <Button key={index} disabled={busy} variant={Number(option.type) === 14 ? "secondary" : "outline"} className={Number(option.type) === 14 ? "border-2 border-amber-300 bg-amber-100 font-bold text-amber-950 shadow-lg hover:bg-amber-200" : "border-2 bg-white/95 font-bold text-stone-900 shadow-lg"} onClick={() => chooseOption(index)}>{browserOptionLabel(option, index)}</Button>)}</div></div>
+
+          <div className="grid content-end gap-3">
+            <div onDragOver={(event) => { if (dropOption(4, 0) != null) event.preventDefault() }} onDrop={(event) => { event.preventDefault(); dropCard(4, 0) }} className={`flex justify-center rounded-xl p-1 ${dropOption(4, 0) != null ? "bg-sky-300/20 ring-2 ring-sky-300" : ""}`}>{you?.active?.[0] ? <BattleCardView card={you.active[0]} catalog={cardsById} selected={selected.some((value) => optionMatchesCard(options[value], you.active![0]!, 4, 0))} selectable={isSelectable(you.active[0], 4, 0)} onClick={() => selectBoardCard(you.active![0]!, 4, 0)} onPreview={setPreviewCard} /> : <div className="grid h-28 w-20 place-items-center rounded-lg border-2 border-dashed border-white/20 text-xs text-white/30">バトル場</div>}</div>
+            <div className="flex min-h-0 w-full items-center justify-center gap-1 px-2 sm:px-16">{you?.bench?.map((card, index) => <div key={card.serial} onDragOver={(event) => { if (dropOption(5, index) != null) event.preventDefault() }} onDrop={(event) => { event.preventDefault(); dropCard(5, index) }} className={`w-[min(8vh,calc((100%_-_1rem)/5))] max-w-[6.25rem] min-w-0 rounded-xl p-0.5 ${dropOption(5, index) != null ? "bg-sky-300/20 ring-2 ring-sky-300" : ""}`}><BattleCardView fluid card={card} catalog={cardsById} selected={selected.some((value) => optionMatchesCard(options[value], card, 5, index))} selectable={isSelectable(card, 5, index)} onClick={() => selectBoardCard(card, 5, index)} onPreview={setPreviewCard} /></div>)}{(you?.bench.length ?? 0) < (you?.benchMax ?? 5) ? <div onDragOver={(event) => { if (dropOption(5, you?.bench.length ?? 0) != null) event.preventDefault() }} onDrop={(event) => { event.preventDefault(); dropCard(5, you?.bench.length ?? 0) }} className={`grid aspect-[5/7] w-[min(8vh,6.25rem)] min-w-0 place-items-center rounded-xl border-2 border-dashed text-[10px] ${dropOption(5, you?.bench.length ?? 0) != null ? "border-sky-200 bg-sky-300/25 text-white ring-2 ring-sky-300" : "border-white/15 text-white/30"}`}>BENCH</div> : null}</div>
+            <div className="flex items-end justify-between gap-3">
+              <div className="flex items-end gap-3"><PrizeCards count={you?.prize?.length ?? 0} /><CardBackStack count={you?.deckCount ?? 0} label="山札" /></div>
+              <div className="min-w-0 flex-1 overflow-hidden pb-1"><div className="flex w-full items-end justify-center gap-1 px-1">{you?.hand?.map((card, index) => <div key={card.serial} style={{ width: `min(8rem, calc((100% - ${Math.max(0, (you.hand?.length ?? 1) - 1) * 0.25}rem) / ${you.hand?.length || 1}))`, maxWidth: "10vh" }} draggable={isSelectable(card, 2, index)} onDragStart={(event) => { event.stopPropagation(); event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("application/x-friend-battle-card", String(card.serial)); setDragged({ card, area: 2, index }) }} onDragEnd={(event) => { event.stopPropagation(); setDragged(null) }} className={`min-w-0 shrink ${dragged?.card.serial === card.serial ? "opacity-40" : ""}`}><BattleCardView fluid card={card} catalog={cardsById} selected={selected.some((value) => optionMatchesCard(options[value], card, 2, index))} selectable={isSelectable(card, 2, index)} onClick={() => selectBoardCard(card, 2, index)} onPreview={setPreviewCard} /></div>)}</div></div>
+              <div className="w-20 text-right"><div className="text-sm font-bold">あなた</div><div className="text-xs text-white/60">手札 {you?.handCount ?? 0}枚</div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {actionChoices.length || minCount !== 1 || maxCount !== 1 || battle.error || !battle.your_turn || battle.result >= 0 ? <section id="battle-actions" className="absolute top-1/2 left-1/2 z-20 max-h-[62%] w-[min(94%,900px)] -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-xl border bg-background/95 p-3 shadow-2xl backdrop-blur">
+        {battle.error ? <div className="mb-3 rounded-md bg-rose-50 p-3 text-sm text-rose-800">{battle.error}</div> : null}
+        {battle.result < 0 && battle.your_turn ? <div className="grid gap-3">
+          <div className="text-center font-bold text-sky-950">{contextText}</div>
+          <div className={isSearch ? "grid grid-cols-[repeat(auto-fit,minmax(3.5rem,1fr))] gap-1 overflow-hidden" : "flex min-w-0 justify-center gap-2 overflow-hidden"}>{actionChoices.map(({ option, index }) => { const source = cardForOption(option, battle); const target = targetForOption(option, battle); return <button key={index} type="button" disabled={busy} title={source ? cardsById.get(source.id)?.name : browserOptionLabel(option, index)} className={`flex min-w-0 shrink items-center justify-center gap-1 rounded-xl border-2 p-1 transition ${selected.includes(index) ? "-translate-y-1 border-sky-600 bg-sky-50 ring-4 ring-sky-400/50" : "border-transparent bg-background hover:-translate-y-1 hover:border-sky-400"}`} onClick={() => chooseOption(index)}>{source ? <><img src={cardsById.get(source.id)?.image_url || `/api/cards/${source.id}/image?lang=ja`} className={isSearch ? "max-h-[11vh] min-w-0 rounded object-contain" : "h-[clamp(7rem,20vh,12rem)] min-w-0 rounded-lg object-contain shadow-md"} alt={cardsById.get(source.id)?.name || "カード"} />{target ? <><span className="shrink-0 text-xl text-muted-foreground">→</span><img src={cardsById.get(target.id)?.image_url || `/api/cards/${target.id}/image?lang=ja`} className="h-[clamp(7rem,20vh,12rem)] min-w-0 rounded-lg object-contain shadow-md" alt={cardsById.get(target.id)?.name || "対象カード"} /></> : null}</> : <span className="px-5 py-4 text-base font-bold">{browserOptionLabel(option, index)}</span>}</button> })}</div>
+          {minCount !== 1 || maxCount !== 1 ? <div className="flex justify-end gap-2">{selected.length ? <Button variant="ghost" disabled={busy} onClick={() => setSelected([])}>選択をキャンセル</Button> : null}{minCount === 0 ? <Button variant="outline" disabled={busy} onClick={() => void submitAction([])}>選ばない</Button> : null}<Button disabled={busy || selected.length < minCount || selected.length > maxCount} onClick={() => void submitAction()}>{busy ? <RefreshCw className="animate-spin" /> : <Check />}確定</Button></div> : null}
+        </div> : battle.result < 0 ? <div className="flex items-center gap-3 text-amber-900"><RefreshCw className="animate-spin" />Agentが操作しています…</div> : <div className="flex items-center justify-between"><div className={`text-xl font-black ${battle.result === 0 ? "text-emerald-700" : "text-rose-700"}`}>{resultLabel}</div><Button onClick={() => void finishBattle()}>設定画面へ戻る</Button></div>}
+      </section> : null}
+      </div>
+      {previewCard ? <div className="pointer-events-none fixed top-1/2 right-4 z-[80] w-[min(24rem,32vw)] -translate-y-1/2 rounded-2xl border-4 border-white bg-stone-950 p-2 shadow-2xl"><img draggable={false} src={cardsById.get(previewCard.id)?.image_url || `/api/cards/${previewCard.id}/image?lang=ja`} alt={cardsById.get(previewCard.id)?.name || "カード"} className="h-auto w-full rounded-xl object-contain" /></div> : null}
+    </div>
+  )
+}
+
 function AgentDetail({ id }: { id: string }) {
   const [agent, setAgent] = useState<Agent | null>(null)
   const [tournament, setTournament] = useState<Tournament | null>(null)
@@ -1532,7 +1918,10 @@ function GlobalAgentDropzone({ onUploaded }: { onUploaded: (path: string) => voi
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
-    const hasFiles = (event: DragEvent) => Array.from(event.dataTransfer?.types || []).includes("Files")
+    const hasFiles = (event: DragEvent) => {
+      const types = Array.from(event.dataTransfer?.types || [])
+      return !types.includes("application/x-friend-battle-card") && types.includes("Files")
+    }
     const onDragEnter = (event: DragEvent) => {
       if (!hasFiles(event)) return
       event.preventDefault()
@@ -1665,6 +2054,7 @@ export function App() {
           {page.name === "ranking" ? <RankingPage /> : null}
           {page.name === "agents" ? <AgentsPage /> : null}
           {page.name === "decks" ? <DecksPage /> : null}
+          {page.name === "play" ? <BrowserBattlePage /> : null}
           {page.name === "agent" ? <AgentDetail id={page.id} /> : null}
           {page.name === "jobs" ? <JobsPage /> : null}
           {page.name === "job" ? <JobDetail id={page.id} /> : null}

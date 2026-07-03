@@ -67,6 +67,37 @@ def card_catalog(language: str = "en") -> tuple[dict[int, str], dict[int, int]]:
     return names, order
 
 
+@lru_cache(maxsize=2)
+def card_categories(language: str = "en") -> dict[int, str]:
+    csv_path, _, id_column, _ = card_data(language)
+    category_column = "ポケモンの進化の段階/エネルギー・トレーナーズの種類" if language == "ja" else "Evolution Stage / Energy / Trainer Type"
+    categories: dict[int, str] = {}
+    with csv_path.open(encoding="utf-8-sig", newline="") as file:
+        for row in csv.DictReader(file):
+            try:
+                card_id = int(str(row.get(id_column, "")).strip())
+            except ValueError:
+                continue
+            categories.setdefault(card_id, str(row.get(category_column, "")).strip())
+    return categories
+
+
+@lru_cache(maxsize=1)
+def japanese_move_names() -> dict[str, str]:
+    with CARD_CSV_EN.open(encoding="utf-8-sig", newline="") as en_file, CARD_CSV_JA.open(encoding="utf-8-sig", newline="") as ja_file:
+        en_rows = list(csv.DictReader(en_file))
+        ja_rows = list(csv.DictReader(ja_file))
+    names: dict[str, str] = {}
+    for en_row, ja_row in zip(en_rows, ja_rows):
+        if en_row.get("Card ID") != ja_row.get("カード ID"):
+            continue
+        english = str(en_row.get("Move Name", "")).strip()
+        japanese = str(ja_row.get("ワザ名", "")).strip()
+        if english and english != "n/a" and japanese and japanese != "n/a":
+            names.setdefault(english, japanese.removeprefix("[特性]"))
+    return names
+
+
 def deck_summary(deck_path: Path) -> dict[str, object]:
     cards = read_deck(deck_path)
     counts = Counter(cards)

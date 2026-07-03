@@ -21,7 +21,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from deck_preview import card_catalog, deck_summary, render_card_image, render_deck_preview
+from deck_preview import card_catalog, card_categories, deck_summary, japanese_move_names, render_card_image, render_deck_preview
+from cg.api import all_attack
+from cg.game import battle_finish as interactive_battle_finish
+from cg.game import battle_select as interactive_battle_select
+from cg.game import battle_start as interactive_battle_start
+from cg.game import visualize_data as interactive_visualize_data
+from tools.friend_battle import LoadedAgent, load_agent, safe_call_agent
 
 try:
     from flask import Flask, Response, flash, jsonify, redirect, render_template_string, request, send_file, url_for
@@ -34,6 +40,7 @@ RUNS_DIR = ROOT / "runs"
 INDEX_PATH = RUNS_DIR / "index.jsonl"
 REPLAYS_DIR = ROOT / "replays"
 JOBS_REPLAY_DIR = REPLAYS_DIR / "jobs"
+BROWSER_REPLAY_DIR = REPLAYS_DIR / "browser"
 AGENTS_DIR = ROOT / "agents"
 DECKS_DIR = ROOT / "decks"
 UPLOADS_DIR = ROOT / "uploads"
@@ -72,6 +79,9 @@ JOB_PRIORITIES = {
 app = Flask(__name__)
 app.secret_key = os.environ.get("FRIEND_BATTLE_SECRET", "friend-battle-dev")
 _battle_operation_lock = threading.Lock()
+_interactive_lock = threading.RLock()
+_interactive_battle: dict[str, Any] | None = None
+_attack_names: dict[int, str] | None = None
 
 BASE_CSS = """
 <style>
@@ -124,7 +134,7 @@ def rel(path: str | Path) -> str:
 
 
 def ensure_dirs() -> None:
-    for p in (RUNS_DIR, REPLAYS_DIR, JOBS_REPLAY_DIR, AGENTS_DIR, DECKS_DIR, UPLOADS_DIR):
+    for p in (RUNS_DIR, REPLAYS_DIR, JOBS_REPLAY_DIR, BROWSER_REPLAY_DIR, AGENTS_DIR, DECKS_DIR, UPLOADS_DIR):
         p.mkdir(parents=True, exist_ok=True)
 
 
@@ -185,6 +195,23 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_priority_created ON jobs(status, priority, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_agents ON jobs(agent0_id, agent1_id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS browser_matches (
+              id TEXT PRIMARY KEY,
+              opponent_id TEXT NOT NULL,
+              opponent_name TEXT NOT NULL,
+              deck_id TEXT NOT NULL,
+              status TEXT NOT NULL,
+              result INTEGER NOT NULL DEFAULT -1,
+              action_count INTEGER NOT NULL DEFAULT 0,
+              replay_path TEXT NOT NULL,
+              started_at TEXT NOT NULL,
+              finished_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_browser_matches_finished ON browser_matches(finished_at DESC)")
 
         def ensure_column(table: str, name: str, ddl: str) -> None:
             cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -1832,6 +1859,306 @@ def api_create_tournament():
     return jsonify({"ok": True, "message": f"{tournament['name']} を開始しました。", "tournament": tournament, "jobs": len(job_ids)})
 
 
+def interactive_deck(deck_id: str) -> list[int]:
+    if deck_id.startswith("agent:"):
+        agent = get_agent(deck_id.removeprefix("agent:"))
+        path = resolve_agent_path(agent) / "deck.csv" if agent else None
+    else:
+        found = get_library_deck(deck_id)
+        path = found[1] if found else None
+    if not path or not path.is_file():
+        raise ValueError("選択したデッキが見つかりません")
+    cards = [int(line.strip()) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if len(cards) != 60:
+        raise ValueError("デッキは60枚である必要があります")
+    return cards
+
+
+def interactive_observation(obs: dict[str, Any]) -> dict[str, Any]:
+    snapshot = dict(obs)
+    snapshot.pop("search_begin_input", None)
+    return json.loads(json.dumps(snapshot, ensure_ascii=False))
+
+
+def save_interactive_match(state: dict[str, Any], status: str | None = None) -> None:
+    if state.get("saved"):
+        return
+    result = int((state.get("obs", {}).get("current") or {}).get("result", -1))
+    final_status = status or ("completed" if result >= 0 else "cancelled")
+    finished_at = now_iso()
+    replay_path = BROWSER_REPLAY_DIR / f"{state['id']}.json"
+    replay = {
+        "schema_version": 1,
+        "match_id": state["id"],
+        "mode": "human_vs_agent",
+        "opponent": {"id": state["opponent_id"], "name": state["opponent_name"]},
+        "deck_id": state["deck_id"],
+        "status": final_status,
+        "result": result,
+        "started_at": state["started_at"],
+        "finished_at": finished_at,
+        "initial_observation": state["initial_observation"],
+        "steps": state["steps"],
+        "final_observation": interactive_observation(state["obs"]),
+        "visualize_data": interactive_visualize_data(),
+    }
+    replay_path.write_text(json.dumps(replay, ensure_ascii=False, indent=2), encoding="utf-8")
+    with db() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO browser_matches
+               (id, opponent_id, opponent_name, deck_id, status, result, action_count, replay_path, started_at, finished_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (state["id"], state["opponent_id"], state["opponent_name"], state["deck_id"], final_status, result,
+             len(state["actions"]), rel(replay_path), state["started_at"], finished_at),
+        )
+    state["saved"] = True
+
+
+def interactive_advance_ai(state: dict[str, Any]) -> None:
+    for _ in range(500):
+        obs = state["obs"]
+        current = obs.get("current") or {}
+        if int(current.get("result", -1)) >= 0 or int(current.get("yourIndex", 0)) == 0:
+            return
+        action = safe_call_agent(state["agent"], obs)
+        state["actions"].append({"player": 1, "action": action})
+        state["obs"] = interactive_battle_select(action)
+        state["steps"].append({"player": 1, "action": action, "observation": interactive_observation(state["obs"])})
+        state["revision"] += 1
+    raise RuntimeError("Agentの選択が500回を超えました")
+
+
+def public_interactive_logs(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the human player's view from exposing the opponent's hidden cards."""
+    visible: list[dict[str, Any]] = []
+    for source in logs[-30:]:
+        log = dict(source)
+        player = int(log.get("playerIndex", -1))
+        log_type = int(log.get("type", -1))
+        destination = int(log.get("toArea", -1))
+        if player == 1 and (log_type == 4 or (log_type == 6 and destination in {1, 2, 6})):
+            log.pop("cardId", None)
+            log.pop("serial", None)
+        visible.append(log)
+    return visible
+
+
+def interactive_attack_names() -> dict[int, str]:
+    global _attack_names
+    if _attack_names is None:
+        localized = japanese_move_names()
+        _attack_names = {int(attack.attackId): localized.get(str(attack.name), str(attack.name)) for attack in all_attack()}
+    return _attack_names
+
+
+def interactive_state(state: dict[str, Any]) -> dict[str, Any]:
+    obs = state["obs"]
+    current = obs.get("current") or {}
+    result = int(current.get("result", -1))
+    select = dict(obs.get("select") or {})
+    attack_names = interactive_attack_names()
+    select["option"] = [
+        {**option, **({"attackName": attack_names.get(int(option["attackId"]), f"ワザ {option['attackId']}")} if option.get("attackId") is not None else {})}
+        for option in select.get("option") or []
+    ]
+    return {
+        "session_id": state["id"],
+        "opponent": {"id": state["opponent_id"], "name": state["opponent_name"]},
+        "deck_id": state["deck_id"],
+        "your_turn": result < 0 and int(current.get("yourIndex", 0)) == 0,
+        "result": result,
+        "current": current,
+        "select": select,
+        "logs": public_interactive_logs(obs.get("logs") or []),
+        "action_count": len(state["actions"]),
+        "revision": state["revision"],
+        "visualizer_url": f"/api/play/visualizer?session_id={state['id']}&revision={state['revision']}",
+        "error": state.get("error"),
+    }
+
+
+def require_interactive_session(session_id: str) -> dict[str, Any]:
+    if not _interactive_battle or _interactive_battle.get("id") != session_id:
+        raise ValueError("対戦セッションが見つかりません")
+    return _interactive_battle
+
+
+@app.post("/api/play/start")
+def api_play_start():
+    global _interactive_battle
+    payload = request.get_json(silent=True) or {}
+    opponent_id = str(payload.get("opponent_agent_id") or "")
+    deck_id = str(payload.get("deck_id") or "")
+    opponent = get_agent(opponent_id)
+    if not opponent or opponent.get("status") != "ready":
+        return jsonify({"error": "対戦可能なAgentが見つかりません"}), 404
+    with _interactive_lock:
+        if _interactive_battle:
+            try:
+                save_interactive_match(_interactive_battle, "cancelled")
+                interactive_battle_finish()
+            except Exception:
+                pass
+            _interactive_battle = None
+        try:
+            human_deck = interactive_deck(deck_id)
+            loaded_agent = load_agent(resolve_agent_path(opponent), "browser_opponent")
+            obs, start_data = interactive_battle_start(human_deck, loaded_agent.deck)
+            if obs is None:
+                raise ValueError(f"対戦を開始できませんでした: player={start_data.errorPlayer} type={start_data.errorType}")
+            state = {
+                "id": uuid.uuid4().hex,
+                "opponent_id": opponent_id,
+                "opponent_name": opponent["name"],
+                "deck_id": deck_id,
+                "agent": loaded_agent,
+                "obs": obs,
+                "actions": [],
+                "steps": [],
+                "initial_observation": interactive_observation(obs),
+                "started_at": now_iso(),
+                "saved": False,
+                "revision": 0,
+            }
+            _interactive_battle = state
+            interactive_advance_ai(state)
+            if int((state["obs"].get("current") or {}).get("result", -1)) >= 0:
+                save_interactive_match(state, "completed")
+            return jsonify({"ok": True, "battle": interactive_state(state)})
+        except Exception as exc:
+            if _interactive_battle:
+                try:
+                    interactive_battle_finish()
+                except Exception:
+                    pass
+                _interactive_battle = None
+            return jsonify({"error": str(exc)}), 400
+
+
+@app.get("/api/play/state")
+def api_play_state():
+    with _interactive_lock:
+        try:
+            state = require_interactive_session(str(request.args.get("session_id") or ""))
+            return jsonify({"battle": interactive_state(state)})
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 404
+
+
+@app.post("/api/play/select")
+def api_play_select():
+    payload = request.get_json(silent=True) or {}
+    session_id = str(payload.get("session_id") or "")
+    action = payload.get("action")
+    if not isinstance(action, list) or not all(isinstance(value, int) for value in action):
+        return jsonify({"error": "action must be list[int]"}), 400
+    with _interactive_lock:
+        try:
+            state = require_interactive_session(session_id)
+            current = state["obs"].get("current") or {}
+            if int(current.get("result", -1)) >= 0:
+                return jsonify({"error": "対戦は終了しています"}), 409
+            if int(current.get("yourIndex", 0)) != 0:
+                return jsonify({"error": "現在はAgentの手番です"}), 409
+            state["actions"].append({"player": 0, "action": action})
+            state["obs"] = interactive_battle_select(action)
+            state["steps"].append({"player": 0, "action": action, "observation": interactive_observation(state["obs"])})
+            state["revision"] += 1
+            interactive_advance_ai(state)
+            if int((state["obs"].get("current") or {}).get("result", -1)) >= 0:
+                save_interactive_match(state, "completed")
+            return jsonify({"ok": True, "battle": interactive_state(state)})
+        except Exception as exc:
+            if _interactive_battle:
+                _interactive_battle["error"] = repr(exc)
+            return jsonify({"error": str(exc)}), 400
+
+
+@app.post("/api/play/finish")
+def api_play_finish():
+    global _interactive_battle
+    payload = request.get_json(silent=True) or {}
+    with _interactive_lock:
+        try:
+            state = require_interactive_session(str(payload.get("session_id") or ""))
+            save_interactive_match(state)
+            interactive_battle_finish()
+        except Exception:
+            pass
+        _interactive_battle = None
+    return jsonify({"ok": True})
+
+
+@app.get("/api/play/visualizer")
+def api_play_visualizer():
+    with _interactive_lock:
+        try:
+            require_interactive_session(str(request.args.get("session_id") or ""))
+            payload = interactive_visualize_data()
+        except Exception as exc:
+            return Response(str(exc), status=404)
+    body = f"""
+    <!doctype html><meta charset='utf-8'>
+    <form id='visualizerForm' method='POST' action='{esc(VISUALIZER_POST_URL)}'>
+      <input type='hidden' name='{esc(VISUALIZER_FIELD)}' value='{esc(payload)}'>
+    </form>
+    <script>document.getElementById('visualizerForm').submit()</script>
+    """
+    return Response(body, mimetype="text/html")
+
+
+@app.get("/api/play/history")
+def api_play_history():
+    try:
+        limit = max(1, min(int(request.args.get("limit", 50)), 200))
+    except ValueError:
+        return jsonify({"error": "limit must be a number"}), 400
+    with db() as conn:
+        rows = [dict(row) for row in conn.execute("SELECT * FROM browser_matches ORDER BY finished_at DESC LIMIT ?", (limit,)).fetchall()]
+    for row in rows:
+        row["replay_url"] = f"/api/play/history/{urllib.parse.quote(row['id'])}/replay"
+        row["visualizer_url"] = f"/api/play/history/{urllib.parse.quote(row['id'])}/visualizer"
+        row.pop("replay_path", None)
+    return jsonify({"matches": rows})
+
+
+@app.get("/api/play/history/<match_id>/replay")
+def api_play_history_replay(match_id: str):
+    with db() as conn:
+        row = conn.execute("SELECT replay_path FROM browser_matches WHERE id=?", (match_id,)).fetchone()
+    if not row:
+        return jsonify({"error": "試合履歴が見つかりません"}), 404
+    path = ROOT / row["replay_path"]
+    if not path.is_file():
+        return jsonify({"error": "Replay JSONが見つかりません"}), 404
+    return send_file(path, mimetype="application/json", as_attachment=request.args.get("download") == "1", download_name=f"battle-{match_id}.json")
+
+
+@app.get("/api/play/history/<match_id>/visualizer")
+def api_play_history_visualizer(match_id: str):
+    with db() as conn:
+        row = conn.execute("SELECT replay_path FROM browser_matches WHERE id=?", (match_id,)).fetchone()
+    if not row:
+        return Response("試合履歴が見つかりません", status=404)
+    path = ROOT / row["replay_path"]
+    if not path.is_file():
+        return Response("Replay JSONが見つかりません", status=404)
+    replay = json.loads(path.read_text(encoding="utf-8"))
+    payload = replay.get("visualize_data")
+    if not payload:
+        return Response("この履歴にはVisualizerデータがありません", status=404)
+    if not isinstance(payload, str):
+        payload = json.dumps(payload, ensure_ascii=False)
+    body = f"""
+    <!doctype html><meta charset='utf-8'>
+    <form id='visualizerForm' method='POST' action='{esc(VISUALIZER_POST_URL)}'>
+      <input type='hidden' name='{esc(VISUALIZER_FIELD)}' value='{esc(payload)}'>
+    </form>
+    <script>document.getElementById('visualizerForm').submit()</script>
+    """
+    return Response(body, mimetype="text/html")
+
+
 @app.post("/api/tournaments/<tournament_id>/reset-and-restart")
 def api_reset_tournament(tournament_id: str):
     payload = request.get_json(silent=True) or {}
@@ -2140,10 +2467,11 @@ def api_cards():
         return jsonify({"error": "lang must be ja or en"}), 400
     try:
         names, order = card_catalog(language)
+        categories = card_categories(language)
     except OSError as exc:
         return jsonify({"error": str(exc)}), 503
     cards = [
-        {"id": card_id, "name": names.get(card_id, ""), "image_url": f"/api/cards/{card_id}/image?lang={language}"}
+        {"id": card_id, "name": names.get(card_id, ""), "category": categories.get(card_id, ""), "image_url": f"/api/cards/{card_id}/image?lang={language}"}
         for card_id in sorted(order, key=order.get)
     ]
     return jsonify({"language": language, "cards": cards})
@@ -2854,6 +3182,13 @@ def api_endpoints():
         {"method": "GET", "path": "/api/ranking?tournament_id={season_id}", "description": "シーズン別ランキング"},
         {"method": "GET", "path": "/api/tournaments", "description": "シーズン一覧"},
         {"method": "GET", "path": "/api/jobs", "description": "Job一覧"},
+        {"method": "POST", "path": "/api/play/start", "description": "ブラウザ対戦を開始"},
+        {"method": "GET", "path": "/api/play/state?session_id={session_id}", "description": "ブラウザ対戦の状態"},
+        {"method": "POST", "path": "/api/play/select", "description": "人間の操作を選択"},
+        {"method": "POST", "path": "/api/play/finish", "description": "ブラウザ対戦を終了"},
+        {"method": "GET", "path": "/api/play/history", "description": "ブラウザ対戦の試合履歴"},
+        {"method": "GET", "path": "/api/play/history/{match_id}/replay", "description": "ブラウザ対戦のReplay JSON。?download=1で保存"},
+        {"method": "GET", "path": "/api/play/history/{match_id}/visualizer", "description": "ブラウザ対戦を外部Visualizerで表示"},
         {"method": "GET", "path": "/api/replays?limit=100", "description": "Replay一覧"},
         {"method": "GET", "path": "/api/replays/{run_id}/manifest", "description": "Replay manifest"},
         {"method": "GET", "path": "/api/replays/{run_id}/games/{game}/json", "description": "整形JSON表示。?download=1で保存"},

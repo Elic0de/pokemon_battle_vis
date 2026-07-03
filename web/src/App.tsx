@@ -1259,6 +1259,8 @@ function BrowserBattlePage() {
   const [selected, setSelected] = useState<number[]>([])
   const [dragged, setDragged] = useState<{ card: BattleCard; area: number; index: number } | null>(null)
   const [previewCard, setPreviewCard] = useState<BattleCard | null>(null)
+  const [actionFlash, setActionFlash] = useState<{ cardId: number | null; text: string } | null>(null)
+  const lastActionFlash = useRef("")
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
@@ -1276,6 +1278,29 @@ function BrowserBattlePage() {
       setDeckId((current) => current || deckData.decks[0]?.id || "")
     })
   }, [])
+
+  useEffect(() => {
+    if (!battle) return
+    if (!battle.logs.length) {
+      lastActionFlash.current = ""
+      setActionFlash(null)
+      return
+    }
+    const log = [...battle.logs].reverse().find((entry) => [8, 9, 10, 11, 12, 15].includes(Number(entry.type)))
+    if (!log) {
+      lastActionFlash.current = ""
+      return
+    }
+    const signature = JSON.stringify(log)
+    if (signature === lastActionFlash.current) return
+    lastActionFlash.current = signature
+    const cardId = Number(log.cardId || log.cardIdAfter || log.cardIdBench || 0) || null
+    const text = battleLogText(log, new Map(catalog.map((card) => [card.id, card])), battle.opponent.name)
+    if (!text) return
+    setActionFlash({ cardId, text })
+    const timer = window.setTimeout(() => setActionFlash(null), 900)
+    return () => window.clearTimeout(timer)
+  }, [battle?.revision, battle?.logs, battle?.opponent.name, catalog])
 
   const options = battle?.select.option || []
   const minCount = Number(battle?.select.minCount ?? 1)
@@ -1402,7 +1427,11 @@ function BrowserBattlePage() {
     const source = cardForOption(option, battle)
     return ![10, 12, 13, 14].includes(Number(option.type)) && (isSearch || !source || source.playerIndex !== 0 || !you?.hand?.some((card) => card.serial === source.serial))
   })
-  const visibleLogs = battle.logs.map((log) => battleLogText(log, cardsById, battle.opponent.name)).filter((text): text is string => Boolean(text)).slice(-6)
+  const latestLogStart = battle.logs.reduce((latest, log, index) => [2, 3, 8, 9, 10, 11, 12, 15].includes(Number(log.type)) ? index : latest, -1)
+  const currentLogs = latestLogStart >= 0 ? battle.logs.slice(latestLogStart) : battle.logs
+  const visibleLogs = currentLogs.map((log) => battleLogText(log, cardsById, battle.opponent.name)).filter((text): text is string => Boolean(text)).slice(-6)
+  const previewPokemon = previewCard && "energyCards" in previewCard ? previewCard as BattlePokemon : null
+  const previewAttachments = previewPokemon ? [...(previewPokemon.energyCards || []), ...(previewPokemon.tools || []), ...((previewPokemon as BattlePokemon & { preEvolution?: BattleCard[] }).preEvolution || [])] : []
   return (
     <div className="grid h-[calc(100svh-7rem)] min-h-0 grid-rows-[auto_minmax(0,1fr)] gap-2 overflow-hidden">
       <header className="flex flex-wrap items-center justify-between gap-2 rounded-xl border bg-background px-3 py-2 shadow-sm">
@@ -1414,6 +1443,7 @@ function BrowserBattlePage() {
       <section className="relative h-full min-h-0 overflow-hidden rounded-2xl border-4 border-emerald-950/50 bg-[radial-gradient(circle_at_center,_#277c62_0%,_#145842_55%,_#0b392d_100%)] p-2 text-white shadow-xl">
         <div className="pointer-events-none absolute inset-x-0 top-1/2 border-t-2 border-dashed border-white/15" />
         {visibleLogs.length ? <div className="pointer-events-none absolute top-16 right-2 z-10 grid w-[min(20rem,42%)] gap-0.5 rounded-lg bg-black/65 p-2 text-[11px] shadow-lg backdrop-blur-sm">{visibleLogs.map((text, index) => <div key={`${battle.revision}-${index}`} className={index === visibleLogs.length - 1 ? "font-bold text-amber-200" : "text-white/70"}>{text}</div>)}</div> : null}
+        {actionFlash ? <div className="pointer-events-none absolute top-1/2 left-1/2 z-10 flex -translate-x-1/2 -translate-y-1/2 animate-in items-center gap-3 rounded-2xl border-2 border-white/70 bg-black/75 p-3 text-white shadow-2xl duration-300 zoom-in-75 fade-in">{actionFlash.cardId ? <img draggable={false} src={cardsById.get(actionFlash.cardId)?.image_url || `/api/cards/${actionFlash.cardId}/image?lang=ja`} alt="" className="h-36 rounded-lg object-contain" /> : null}<span className="max-w-56 text-sm font-bold">{actionFlash.text}</span></div> : null}
         <div className="relative grid h-full min-h-0 grid-rows-[1fr_auto_1fr] gap-1">
           <div className="grid content-start gap-3">
             <div className="flex items-start justify-between gap-3">
@@ -1447,7 +1477,7 @@ function BrowserBattlePage() {
         </div> : battle.result < 0 ? <div className="flex items-center gap-3 text-amber-900"><RefreshCw className="animate-spin" />Agentが操作しています…</div> : <div className="flex items-center justify-between"><div className={`text-xl font-black ${battle.result === 0 ? "text-emerald-700" : "text-rose-700"}`}>{resultLabel}</div><Button onClick={() => void finishBattle()}>設定画面へ戻る</Button></div>}
       </section> : null}
       </div>
-      {previewCard ? <div className="pointer-events-none fixed top-1/2 right-4 z-[80] w-[min(24rem,32vw)] -translate-y-1/2 rounded-2xl border-4 border-white bg-stone-950 p-2 shadow-2xl"><img draggable={false} src={cardsById.get(previewCard.id)?.image_url || `/api/cards/${previewCard.id}/image?lang=ja`} alt={cardsById.get(previewCard.id)?.name || "カード"} className="h-auto w-full rounded-xl object-contain" /></div> : null}
+      {previewCard ? <div className="pointer-events-none fixed top-1/2 right-4 z-[80] flex max-h-[88svh] w-[min(30rem,40vw)] -translate-y-1/2 gap-2 rounded-2xl border-4 border-white bg-stone-950 p-2 shadow-2xl"><img draggable={false} src={cardsById.get(previewCard.id)?.image_url || `/api/cards/${previewCard.id}/image?lang=ja`} alt={cardsById.get(previewCard.id)?.name || "カード"} className="min-w-0 flex-1 rounded-xl object-contain" />{previewAttachments.length ? <div className="grid w-20 content-start gap-1">{previewAttachments.map((card, index) => <img key={`${card.serial}-${index}`} draggable={false} src={cardsById.get(card.id)?.image_url || `/api/cards/${card.id}/image?lang=ja`} alt="" className="w-full rounded object-contain" />)}</div> : null}</div> : null}
     </div>
   )
 }

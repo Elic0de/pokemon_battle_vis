@@ -107,10 +107,15 @@ def load_agent(agent_dir: Path, name: str) -> LoadedAgent:
     sys.path.insert(0, str(agent_dir))
     loaded_modules: dict[str, ModuleType] = {}
     try:
+        # importlib normally registers a module before executing it. Dataclasses
+        # and some typing helpers resolve annotations through sys.modules while
+        # the class body is being created, so the manual loader must do the same.
+        sys.modules[module_name] = module
         with pushd(agent_dir):
             spec.loader.exec_module(module)
         loaded_modules = matching_modules(roots)
     finally:
+        sys.modules.pop(module_name, None)
         sys.path[:] = old_path
         for module_name_to_remove in matching_modules(roots):
             sys.modules.pop(module_name_to_remove, None)
@@ -150,10 +155,37 @@ def result_from_obs(obs: dict[str, Any]) -> tuple[int, int | None]:
     return int(result), reason
 
 
+def enriched_visualize_data(
+    keep_visualize: bool,
+    obs_log: list[Any],
+    action_log: list[list[int] | None],
+) -> str | None:
+    """Attach the exact Agent input and selected action to visualizer frames."""
+    if not keep_visualize:
+        return None
+    payload = visualize_data()
+    try:
+        frames = json.loads(payload)
+    except json.JSONDecodeError:
+        return payload
+    if not isinstance(frames, list):
+        return payload
+    for index, frame in enumerate(frames):
+        if not isinstance(frame, dict):
+            continue
+        observation = obs_log[index] if index < len(obs_log) else ""
+        action = action_log[index] if index < len(action_log) else None
+        frame["obs"] = observation
+        frame["action"] = [action, action]
+    return json.dumps(frames, ensure_ascii=False, separators=(",", ":"))
+
+
 def play_one(agent0: LoadedAgent, agent1: LoadedAgent, max_steps: int, keep_visualize: bool) -> dict[str, Any]:
     obs = None
     started = False
     transcript: list[dict[str, Any]] = []
+    obs_log: list[Any] = [""]
+    action_log: list[list[int] | None] = [None]
     try:
         obs, start_data = battle_start(agent0.deck, agent1.deck)
         started = True
@@ -174,6 +206,10 @@ def play_one(agent0: LoadedAgent, agent1: LoadedAgent, max_steps: int, keep_visu
             your_index = int(cur.get("yourIndex", 0))
             current_agent = agent0 if your_index == 0 else agent1
             action = safe_call_agent(current_agent, obs)
+            logged_obs = dict(obs)
+            logged_obs.pop("search_begin_input", None)
+            obs_log.append(logged_obs)
+            action_log.append(action)
             transcript.append({"step": step, "player": your_index, "agent": current_agent.name, "action": action})
             obs = battle_select(action)
         else:
@@ -183,7 +219,7 @@ def play_one(agent0: LoadedAgent, agent1: LoadedAgent, max_steps: int, keep_visu
                 "steps": max_steps,
                 "first_player": (obs.get("current") or {}).get("firstPlayer") if isinstance(obs, dict) else None,
                 "actions": transcript,
-                "visualize_data": visualize_data() if keep_visualize else None,
+                "visualize_data": enriched_visualize_data(keep_visualize, obs_log, action_log),
             }
 
         result, reason = result_from_obs(obs)
@@ -193,7 +229,7 @@ def play_one(agent0: LoadedAgent, agent1: LoadedAgent, max_steps: int, keep_visu
             "steps": len(transcript),
             "first_player": (obs.get("current") or {}).get("firstPlayer") if isinstance(obs, dict) else None,
             "actions": transcript,
-            "visualize_data": visualize_data() if keep_visualize else None,
+            "visualize_data": enriched_visualize_data(keep_visualize, obs_log, action_log),
         }
     except Exception as exc:
         # If an agent crashes or returns illegal action, that side loses when known.
@@ -208,7 +244,7 @@ def play_one(agent0: LoadedAgent, agent1: LoadedAgent, max_steps: int, keep_visu
             "steps": len(transcript),
             "first_player": (obs.get("current") or {}).get("firstPlayer") if isinstance(obs, dict) else None,
             "actions": transcript,
-            "visualize_data": visualize_data() if (started and keep_visualize) else None,
+            "visualize_data": enriched_visualize_data(keep_visualize, obs_log, action_log) if started else None,
         }
     finally:
         if started:

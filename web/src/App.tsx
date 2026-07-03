@@ -31,11 +31,12 @@ import {
   RotateCcw,
   Settings,
   Trash2,
+  TriangleAlert,
   Trophy,
   Upload,
 } from "lucide-react"
 import { toast } from "sonner"
-import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts"
+import { Bar, BarChart, CartesianGrid, Line, LineChart, XAxis, YAxis } from "recharts"
 
 import {
   AlertDialog,
@@ -86,6 +87,7 @@ import {
 } from "@/components/ui/tooltip"
 import { AgentHoverCard } from "@/components/agent-hover-card"
 import { GameManagement } from "@/components/game-management"
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card"
 import { api } from "@/lib/api"
 import type { Agent, AgentMeta } from "@/types/agent"
 import type { Tournament } from "@/types/tournament"
@@ -174,6 +176,7 @@ type AgentHistory = {
   run_id: string
   game_index: number
   opponent_name: string
+  opponent_id: string
   result: "win" | "loss" | "draw"
   seat: "first" | "second" | "-"
   steps?: number | string
@@ -209,6 +212,21 @@ type AgentHistoryGroup = {
   created_at?: string
   winner: "agent" | "opponent" | "draw"
   duration_seconds?: number | null
+}
+
+type AgentVersionRecord = {
+  agent_id: string
+  name: string
+  version: number
+  created_at?: string
+  status?: string
+  current_elo: number
+  peak_elo: number
+  games: number
+  latest_tournament_id?: string | null
+  latest_tournament_name?: string | null
+  best_tournament_id?: string | null
+  best_tournament_name?: string | null
 }
 
 type ReplayItem = {
@@ -280,7 +298,7 @@ const navItems = [
   { path: "/decks", label: "デッキ", icon: Library },
   { path: "/jobs", label: "Jobs", icon: Activity },
   { path: "/runs", label: "試合履歴", icon: History },
-  { path: "/management", label: "総当たり大会", icon: Settings },
+  { path: "/management", label: "シーズン管理", icon: Settings },
 ]
 
 const statusTone: Record<string, string> = {
@@ -316,6 +334,22 @@ function classNames(...values: Array<string | false | null | undefined>) {
 function StatusPill({ value }: { value?: string }) {
   const label = value || "-"
   return <Badge variant="outline" className={statusTone[label] || "bg-stone-100 text-stone-700 ring-stone-200"}>{label}</Badge>
+}
+
+function ErrorHover({ error, stderr }: { error?: string; stderr?: string }) {
+  const details = [error?.trim(), stderr?.trim()].filter(Boolean).join("\n\n--- stderr ---\n")
+  if (!details) return null
+  return (
+    <HoverCard openDelay={150} closeDelay={100}>
+      <HoverCardTrigger asChild>
+        <button type="button" className="mt-1 block cursor-help"><Badge variant="outline" className="bg-rose-50 text-rose-800 ring-rose-200"><TriangleAlert />エラー詳細</Badge></button>
+      </HoverCardTrigger>
+      <HoverCardContent className="w-[min(42rem,calc(100vw-2rem))] p-0" align="start">
+        <div className="flex items-center gap-2 border-b px-4 py-3 font-semibold text-rose-800"><TriangleAlert className="size-4" />エラー内容</div>
+        <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words bg-stone-950 p-4 font-mono text-xs text-stone-100">{details}</pre>
+      </HoverCardContent>
+    </HoverCard>
+  )
 }
 
 function Panel({ title, children, action }: { title: string; children: React.ReactNode; action?: React.ReactNode }) {
@@ -476,7 +510,7 @@ function FitFrame({ src, title }: { src: string; title: string }) {
   )
 }
 
-function VisualizerActions({ items, index }: { items: ReplayItem[]; index: number }) {
+function VisualizerActions({ items, index, labels = false }: { items: ReplayItem[]; index: number; labels?: boolean }) {
   const [open, setOpen] = useState(false)
   const [activeIndex, setActiveIndex] = useState(index)
   const activeItem = items[activeIndex] || items[index]
@@ -498,15 +532,15 @@ function VisualizerActions({ items, index }: { items: ReplayItem[]; index: numbe
         <Tooltip>
           <TooltipTrigger asChild>
             <DialogTrigger asChild>
-              <Button type="button" variant="outline" size="icon-sm" onClick={openAtIndex}>
+              <Button type="button" variant="outline" size={labels ? "sm" : "icon-sm"} onClick={openAtIndex}>
                 <Eye />
-                <span className="sr-only">モーダルで見る</span>
+                <span className={labels ? "" : "sr-only"}>全画面でリプレイ</span>
               </Button>
             </DialogTrigger>
           </TooltipTrigger>
-          <TooltipContent>モーダルで見る</TooltipContent>
+          <TooltipContent>{labels ? "アプリ内で全画面表示" : "モーダルで見る"}</TooltipContent>
         </Tooltip>
-        <DialogContent className="h-[92svh] max-h-[92svh] max-w-[94vw] grid-rows-[auto_minmax(0,1fr)] gap-2 overflow-hidden p-2 sm:max-w-[94vw]">
+        <DialogContent className="h-[calc(100svh-1rem)] max-h-[calc(100svh-1rem)] w-[calc(100vw-1rem)] max-w-none grid-rows-[auto_minmax(0,1fr)] gap-2 overflow-hidden p-2 sm:!max-w-[calc(100vw-1rem)]">
           <DialogHeader className="grid gap-2 pr-10 sm:grid-cols-[1fr_auto] sm:items-start">
             <div className="grid gap-1">
               <DialogTitle>{activeItem.title}</DialogTitle>
@@ -531,9 +565,10 @@ function VisualizerActions({ items, index }: { items: ReplayItem[]; index: numbe
               <Button asChild variant="outline" size="sm">
                 <a href={activeItem.url} target="_blank" rel="noreferrer">
                   <Maximize2 />
-                  リンク先を開く
+                  外部サイト
                 </a>
               </Button>
+              <Button type="button" variant="secondary" size="sm" onClick={() => setOpen(false)}>閉じる</Button>
             </div>
           </DialogHeader>
           <FitFrame src={embedUrl(activeItem.url)} title={activeItem.title} />
@@ -541,14 +576,14 @@ function VisualizerActions({ items, index }: { items: ReplayItem[]; index: numbe
       </Dialog>
       <Tooltip>
         <TooltipTrigger asChild>
-          <Button asChild variant="outline" size="icon-sm">
+          <Button asChild variant="outline" size={labels ? "sm" : "icon-sm"}>
             <a href={activeItem.url} target="_blank" rel="noreferrer">
               <Maximize2 />
-              <span className="sr-only">リンク先を開く</span>
+              <span className={labels ? "" : "sr-only"}>外部サイト</span>
             </a>
           </Button>
         </TooltipTrigger>
-        <TooltipContent>リンク先を開く</TooltipContent>
+        <TooltipContent>外部Visualizerで開く</TooltipContent>
       </Tooltip>
       <CopyButton getValue={() => absoluteUrl(activeItem.url)} />
     </div>
@@ -617,6 +652,20 @@ function GamePreviewFrame({ game, title }: { game?: AgentHistory; title: string 
   return <FitFrame src={embedUrl(game.visualizer_url)} title={title} />
 }
 
+function DeckPreviewButton({ agentId, agentName, label }: { agentId: string; agentName: string; label: string }) {
+  const encodedId = encodeURIComponent(agentId)
+  return (
+    <Dialog>
+      <DialogTrigger asChild><Button type="button" variant="outline" size="sm"><Library />{label}</Button></DialogTrigger>
+      <DialogContent className="grid h-[92svh] max-h-[92svh] grid-rows-[auto_minmax(0,1fr)_auto] sm:!max-w-[94vw]">
+        <DialogHeader><DialogTitle>{agentName} のデッキ</DialogTitle><DialogDescription>対戦時にAgentへ登録されているdeck.csvの内容です。</DialogDescription></DialogHeader>
+        <div className="min-h-0 overflow-auto rounded-md border bg-white p-2"><img className="mx-auto h-auto max-w-full object-contain" src={`/api/agents/${encodedId}/deck-image?lang=ja`} alt={`${agentName} のデッキ`} /></div>
+        <Button asChild variant="outline"><a href={`/api/agents/${encodedId}/deck.csv`}><Download />deck.csv</a></Button>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 function UploadForm({ defaults, onDone }: { defaults: DashboardData["defaults"]; onDone: (path?: string) => void }) {
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState("")
@@ -655,7 +704,7 @@ function UploadForm({ defaults, onDone }: { defaults: DashboardData["defaults"];
         </Field>
       </div>
       <input type="hidden" name="max_steps" value={defaults.max_steps} />
-      <div className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-950">追加後はSelf Checkのみ自動実行します。比較対戦は「総当たり大会」から開始してください。</div>
+      <div className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-950">追加後にSelf Checkを実行し、合格すると最新シーズンの既存Agentとの対戦だけを自動追加します。</div>
       <div className="flex flex-wrap items-center gap-3">
         <Button disabled={busy}>
           <Upload />
@@ -732,7 +781,7 @@ function DeleteAgentButton({ agent, onDeleted }: { agent: Agent; onDeleted: () =
 
 function JobsTable({ jobs, compact = false }: { jobs: Job[]; compact?: boolean }) {
   const columns = useMemo<AppColumnDef<Job>[]>(() => [
-    { accessorKey: "status", header: "status", cell: ({ row }) => <StatusPill value={row.original.status} /> },
+    { accessorKey: "status", header: "status", cell: ({ row }) => <><StatusPill value={row.original.status} /><ErrorHover error={row.original.error} stderr={row.original.stderr} /></> },
     { accessorKey: "tournament_name", header: "大会", cell: ({ row }) => row.original.tournament_name ? <a className="font-medium hover:underline" href={`/ranking?tournament_id=${encodeURIComponent(row.original.tournament_id || "")}`}>{row.original.tournament_name}</a> : <span className="text-muted-foreground">通常の総当たり戦</span> },
     { id: "matchup", header: "matchup", accessorFn: (job) => `${job.agent0_name} vs ${job.agent1_name}`, cell: ({ row }) => <>{row.original.agent0_name} <span className="text-muted-foreground">vs</span> {row.original.agent1_name}</> },
     { accessorKey: "job_type", header: "type", cell: ({ row }) => <><StatusPill value={row.original.job_type} />{compact ? null : <div className="mt-1 text-xs text-muted-foreground">{row.original.games} games</div>}</> },
@@ -818,11 +867,21 @@ function Dashboard() {
     return () => window.clearInterval(timer)
   }, [load])
   if (!data) return <Loading error={error} />
+  const latestAgent = data.agents[0]
+  const latestWinRate = latestAgent?.games ? latestAgent.wins / latestAgent.games * 100 : 0
   return (
     <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_360px]">
       <Panel title={data.tournament?.name || "総合ランキング（Elo順）"} action={<LinkButton href={data.tournament ? `/ranking?tournament_id=${encodeURIComponent(data.tournament.id)}` : "/ranking"}>すべて見る</LinkButton>}><RankingTable agents={data.ranking} tournamentId={data.tournament?.id} /></Panel>
-      <div className="lg:sticky lg:top-20 lg:self-start">
+      <div className="grid gap-5 lg:sticky lg:top-20 lg:self-start">
         <Panel title="Submit to Battle"><UploadForm defaults={data.defaults} onDone={load} /></Panel>
+        <Panel title="直近追加したAgent">
+          {latestAgent ? <div className="grid gap-4">
+            <div className="flex items-start justify-between gap-3"><div className="min-w-0"><a className="block truncate text-lg font-semibold hover:underline" href={`/agents/${encodeURIComponent(latestAgent.id)}`}>{latestAgent.name}</a><div className="text-xs text-muted-foreground">{relativeTimeLabel(latestAgent.created_at)}に追加</div></div><StatusPill value={latestAgent.status} /></div>
+            <div className="grid grid-cols-3 divide-x rounded-md border text-center"><div className="p-3"><div className="text-xs text-muted-foreground">Elo</div><b className="text-lg">{latestAgent.elo.toFixed(1)}</b></div><div className="p-3"><div className="text-xs text-muted-foreground">成績</div><b className="text-sm"><span className="text-emerald-700">{latestAgent.wins}</span>-<span className="text-rose-700">{latestAgent.losses}</span>-{latestAgent.draws}</b></div><div className="p-3"><div className="text-xs text-muted-foreground">勝率</div><b className="text-lg">{latestWinRate.toFixed(1)}%</b></div></div>
+            {latestAgent.games ? <div className="h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-emerald-500 transition-all" style={{ width: `${latestWinRate}%` }} /></div> : <div className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-900">Self Checkまたはシーズン対戦を待っています。</div>}
+            <Button asChild><a href={`/agents/${encodeURIComponent(latestAgent.id)}`}><Eye />成績を確認</a></Button>
+          </div> : <div className="py-6 text-center text-sm text-muted-foreground">Agentがまだ登録されていません。</div>}
+        </Panel>
       </div>
     </div>
   )
@@ -839,7 +898,7 @@ function AgentsPage() {
   const columns = useMemo<AppColumnDef<Agent>[]>(() => [
     { accessorKey: "name", header: "name", cell: ({ row }) => <><AgentHoverCard agent={row.original}><a className="font-medium text-primary hover:underline" href={`/agents/${encodeURIComponent(row.original.id)}${row.original.tournament_id ? `?tournament_id=${encodeURIComponent(row.original.tournament_id)}` : ""}`}>{row.original.name}</a></AgentHoverCard><div className="font-mono text-xs text-muted-foreground">{row.original.short_id}</div>{row.original.tournament_name ? <div className="text-xs text-muted-foreground">{row.original.tournament_name}</div> : null}</> },
     { accessorKey: "elo", header: "Elo", cell: ({ row }) => <><b>{row.original.elo.toFixed(1)}</b><div className="text-xs text-muted-foreground">{row.original.games} games</div></> },
-    { accessorKey: "status", header: "status", cell: ({ row }) => <><StatusPill value={row.original.status} />{row.original.error ? <div className="mt-1 text-xs text-rose-700">{row.original.error}</div> : null}</> },
+    { accessorKey: "status", header: "status", cell: ({ row }) => <><StatusPill value={row.original.status} /><ErrorHover error={row.original.error} /></> },
     { id: "files", header: "files", accessorFn: (agent) => agent.has_main && agent.has_deck ? "OK" : "NG", cell: ({ row }) => row.original.has_main && row.original.has_deck ? "OK" : "NG" },
     { accessorKey: "created_at", header: "created", cell: ({ row }) => <span className="text-xs text-muted-foreground">{row.original.created_at || "-"}</span>, meta: { className: "whitespace-nowrap" } },
     { id: "delete", header: "", enableSorting: false, cell: ({ row }) => <DeleteAgentButton agent={row.original} onDeleted={load} /> },
@@ -1011,8 +1070,11 @@ function AgentDetail({ id }: { id: string }) {
   const [agent, setAgent] = useState<Agent | null>(null)
   const [tournament, setTournament] = useState<Tournament | null>(null)
   const [history, setHistory] = useState<AgentHistory[]>([])
+  const [seriesName, setSeriesName] = useState("")
+  const [versions, setVersions] = useState<AgentVersionRecord[]>([])
   const [selectedRunId, setSelectedRunId] = useState<string>("")
   const [selectedGameIndex, setSelectedGameIndex] = useState<number | null>(null)
+  const [showAdvancedStats, setShowAdvancedStats] = useState(false)
   const goAgents = useCallback(() => {
     window.history.pushState({}, "", "/agents")
     window.dispatchEvent(new PopStateEvent("popstate"))
@@ -1027,10 +1089,12 @@ function AgentDetail({ id }: { id: string }) {
   useEffect(() => {
     const tournamentId = new URLSearchParams(window.location.search).get("tournament_id")
     const query = tournamentId ? `?tournament_id=${encodeURIComponent(tournamentId)}` : ""
-    api<{ agent: Agent; history: AgentHistory[]; tournament: Tournament | null }>(`/api/agents/${encodeURIComponent(id)}${query}`).then((data) => {
+    api<{ agent: Agent; history: AgentHistory[]; tournament: Tournament | null; series_name: string; versions: AgentVersionRecord[] }>(`/api/agents/${encodeURIComponent(id)}${query}`).then((data) => {
       setAgent(data.agent)
       setHistory(data.history)
       setTournament(data.tournament)
+      setSeriesName(data.series_name)
+      setVersions(data.versions)
     })
   }, [id])
   const groups = useMemo<AgentHistoryGroup[]>(() => {
@@ -1065,6 +1129,25 @@ function AgentDetail({ id }: { id: string }) {
   const visibleGames = activeGroup?.games || []
   const activeGame = visibleGames.find((game) => game.game_index === selectedGameIndex) || visibleGames[0]
   const previewTitle = activeGame ? `${agent?.name || "Agent"} vs ${activeGame.opponent_name}` : "Game History"
+  const replayGames = visibleGames.filter((game): game is AgentHistory & { visualizer_url: string } => Boolean(game.visualizer_url))
+  const agentReplayItems = replayGames.map<ReplayItem>((game) => ({
+    url: game.visualizer_url,
+    title: `${agent?.name || "Agent"} vs ${game.opponent_name}`,
+    description: `Game ${game.game_index} / ${game.result === "win" ? "勝ち" : game.result === "loss" ? "負け" : "引き分け"}`,
+    meta: [
+      { label: "game", value: String(game.game_index) },
+      { label: "result", value: game.result },
+      { label: "seat", value: game.seat === "first" ? "先攻" : game.seat === "second" ? "後攻" : "-" },
+      { label: "steps", value: String(game.steps ?? "-") },
+      { label: "duration", value: durationLabel(game.duration_seconds) },
+    ],
+  }))
+  const activeReplayIndex = activeGame ? Math.max(0, replayGames.findIndex((game) => game.game_index === activeGame.game_index)) : 0
+  const bestVersion = versions.reduce<AgentVersionRecord | null>((best, version) => !best || version.peak_elo > best.peak_elo ? version : best, null)
+  const versionChartConfig = {
+    peak_elo: { label: "最高Elo", color: "var(--chart-1)" },
+    current_elo: { label: "最終Elo", color: "var(--chart-2)" },
+  } satisfies ChartConfig
   const selectGroup = (group: AgentHistoryGroup) => {
     setSelectedRunId(group.run_id)
     setSelectedGameIndex(group.games[0]?.game_index ?? null)
@@ -1085,15 +1168,30 @@ function AgentDetail({ id }: { id: string }) {
           </div>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-x-5 gap-y-2 text-sm">
-          {agent.download_url ? <LinkButton href={agent.download_url}><Download />Agentをダウンロード</LinkButton> : null}
           <div><span className="flex items-center gap-1 text-xs text-muted-foreground"><Trophy className="size-3" />Elo</span><b>{agent.elo.toFixed(1)}</b></div>
           <div><span className="flex items-center gap-1 text-xs text-muted-foreground"><Gamepad2 className="size-3" />Games</span><b>{agent.games}</b></div>
           <div><span className="flex items-center gap-1 text-xs text-muted-foreground"><Activity className="size-3" />通算成績</span><b><span className="text-emerald-700">{agent.wins}勝</span>・<span className="text-rose-700">{agent.losses}敗</span>・{agent.draws}分</b></div>
-          <div><span className="flex items-center gap-1 text-xs text-muted-foreground"><ArrowUp className="size-3" />先攻</span><b>{agent.first_wins}/{agent.first_games}</b></div>
-          <div><span className="flex items-center gap-1 text-xs text-muted-foreground"><ArrowDown className="size-3" />後攻</span><b>{agent.second_wins}/{agent.second_games}</b></div>
+          <Button type="button" variant="outline" size="sm" onClick={() => setShowAdvancedStats((value) => !value)}><ChevronsUpDown />{showAdvancedStats ? "詳細を閉じる" : "詳細指標"}</Button>
           <DeleteAgentButton agent={agent} onDeleted={goAgents} />
         </div>
       </div>
+
+      {showAdvancedStats ? <div className="flex flex-wrap items-center gap-x-8 gap-y-3 border-b bg-muted/30 px-4 py-3 text-sm">
+        <div><span className="flex items-center gap-1 text-xs text-muted-foreground"><ArrowUp className="size-3" />先攻成績</span><b>{agent.first_wins}勝 / {agent.first_games}ゲーム</b></div>
+        <div><span className="flex items-center gap-1 text-xs text-muted-foreground"><ArrowDown className="size-3" />後攻成績</span><b>{agent.second_wins}勝 / {agent.second_games}ゲーム</b></div>
+        <div><span className="text-xs text-muted-foreground">直近20ゲーム</span><b className="block">{agent.last_record}</b></div>
+        {agent.download_url ? <LinkButton href={agent.download_url}><Download />Agentをダウンロード</LinkButton> : null}
+      </div> : null}
+
+      {versions.length > 1 ? <section className="grid gap-4 border-b bg-muted/20 p-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+        <div>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2"><div><h2 className="font-semibold">{seriesName || agent.name} バージョン別レート推移</h2><p className="text-xs text-muted-foreground">各バージョンが大会で記録した最高Eloと最新大会終了時点のElo</p></div>{bestVersion ? <Badge className="bg-amber-100 text-amber-950"><Trophy />歴代最高 {bestVersion.peak_elo.toFixed(1)}（{bestVersion.name}）</Badge> : null}</div>
+          {versions.length ? <ChartContainer config={versionChartConfig} className="h-52 w-full aspect-auto"><LineChart data={versions} margin={{ left: 4, right: 16, top: 12, bottom: 4 }}><CartesianGrid vertical={false} /><XAxis dataKey="name" tickLine={false} axisLine={false} /><YAxis domain={["dataMin - 20", "dataMax + 20"]} tickLine={false} axisLine={false} width={48} /><ChartTooltip content={<ChartTooltipContent />} /><Line dataKey="peak_elo" type="monotone" stroke="var(--color-peak_elo)" strokeWidth={3} dot={{ r: 4 }} /><Line dataKey="current_elo" type="monotone" stroke="var(--color-current_elo)" strokeWidth={2} strokeDasharray="4 3" dot={{ r: 3 }} /></LineChart></ChartContainer> : <div className="py-8 text-center text-sm text-muted-foreground">バージョン履歴がありません。</div>}
+        </div>
+        <div className="max-h-64 overflow-y-auto rounded-md border bg-background">
+          {versions.map((version) => <a key={version.agent_id} href={`/agents/${encodeURIComponent(version.agent_id)}`} className={`flex items-center justify-between gap-3 border-b p-3 last:border-b-0 hover:bg-muted/50 ${version.agent_id === agent.id ? "bg-sky-50" : ""}`}><div className="min-w-0"><div className="truncate font-medium">{version.name}</div><div className="truncate text-xs text-muted-foreground">最高大会：{version.best_tournament_name || "-"}・{version.games} games</div></div><div className="shrink-0 text-right"><b className="tabular-nums">{version.peak_elo.toFixed(1)}</b><div className="text-[10px] text-muted-foreground">最終 {version.current_elo.toFixed(1)}</div></div></a>)}
+        </div>
+      </section> : null}
 
       <div className="grid min-h-[calc(100svh-12rem)] lg:grid-cols-[360px_minmax(0,1fr)]">
         <aside className="min-h-0 border-b bg-background lg:border-r lg:border-b-0">
@@ -1107,8 +1205,6 @@ function AgentDetail({ id }: { id: string }) {
           <div className="max-h-[calc(100svh-17rem)] overflow-auto px-3 py-4">
             {groups.length ? groups.map((group) => {
               const selected = group.run_id === activeGroup?.run_id
-              const runStart = group.games[0]?.game_index ?? 0
-              const runEnd = group.games[group.games.length - 1]?.game_index ?? 0
               const winnerName = group.winner === "agent" ? agent.name : group.winner === "opponent" ? group.opponent_name : "引き分け"
               return (
                 <div key={group.run_id} className="mb-4">
@@ -1121,30 +1217,13 @@ function AgentDetail({ id }: { id: string }) {
                     className={`w-full rounded-lg border bg-background p-3 text-left transition hover:bg-muted/50 ${selected ? "border-foreground shadow-sm" : "border-border"}`}
                     onClick={() => selectGroup(group)}
                   >
-                    <div className="mb-3 flex items-center justify-between gap-2">
+                    <div className="flex items-center justify-between gap-2">
                       <div className="font-semibold">vs {group.opponent_name}</div>
                       <Badge variant="outline"><span className="text-emerald-700">{group.wins}勝</span>・<span className="text-rose-700">{group.losses}敗</span>・{group.draws}分</Badge>
                     </div>
-                    <div className={`mb-3 flex items-center gap-2 rounded-md px-3 py-2 text-sm font-bold ${group.winner === "draw" ? "bg-stone-100 text-stone-800" : "bg-amber-100 text-amber-950"}`}>
-                      {group.winner === "draw" ? <Minus className="size-4" /> : <Trophy className="size-4" />}
-                      {group.winner === "draw" ? "対戦結果：引き分け" : `対戦勝者：${winnerName}`}
-                    </div>
-                    <div className="grid gap-2 text-sm">
-                      <div className="flex items-center justify-between gap-2 border-b pb-2">
-                        <span className="flex items-center gap-2"><Bot className="size-4" />{agent.name}</span>
-                        <span className="text-xs text-muted-foreground">先 {group.first_games}</span>
-                      </div>
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="flex items-center gap-2"><Bot className="size-4" />{group.opponent_name}</span>
-                        <span className="text-xs text-muted-foreground">後 {group.second_games}</span>
-                      </div>
-                    </div>
-                    <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
-                      <span className="font-mono">Game {runStart} → {runEnd}</span>
-                      <span>{group.games.length} games · {durationLabel(group.duration_seconds)} · Elo {group.latest_elo.toFixed(1)}</span>
-                    </div>
+                    <div className="mt-2 flex items-center justify-between gap-3 text-xs text-muted-foreground"><span className={group.winner === "agent" ? "font-medium text-emerald-700" : group.winner === "opponent" ? "font-medium text-rose-700" : ""}>{group.winner === "draw" ? "引き分け" : `勝者：${winnerName}`}</span><span>{group.games.length}ゲーム・{durationLabel(group.duration_seconds)}</span></div>
                     {selected ? (
-                      <div className="mt-3 grid grid-cols-5 gap-1">
+                      <div className="mt-3 border-t pt-3"><div className="mb-2 flex justify-between text-xs text-muted-foreground"><span>ゲームを選択</span><span>Elo {group.latest_elo.toFixed(1)}</span></div><div className="grid grid-cols-5 gap-1">
                         {visibleGames.map((game) => (
                           <Button
                             key={game.game_index}
@@ -1160,7 +1239,7 @@ function AgentDetail({ id }: { id: string }) {
                             {game.game_index}
                           </Button>
                         ))}
-                      </div>
+                      </div></div>
                     ) : null}
                   </button>
                 </div>
@@ -1189,9 +1268,10 @@ function AgentDetail({ id }: { id: string }) {
               ) : null}
               {activeGame ? <Badge variant="outline">{activeGame.seat === "first" ? "先行" : activeGame.seat === "second" ? "後攻" : "-"}</Badge> : null}
               {activeGame ? <Badge variant="outline">steps {String(activeGame.steps ?? "-")}</Badge> : null}
-              {activeGame?.visualizer_url ? <LinkButton href={activeGame.visualizer_url} external><Maximize2 />開く</LinkButton> : null}
+              <DeckPreviewButton agentId={agent.id} agentName={agent.name} label="自分のデッキ" />
+              {activeGame ? <DeckPreviewButton agentId={activeGame.opponent_id} agentName={activeGame.opponent_name} label="相手のデッキ" /> : null}
+              {activeGame?.visualizer_url ? <VisualizerActions items={agentReplayItems} index={activeReplayIndex} labels /> : null}
               {activeGame?.download_url ? <LinkButton href={activeGame.download_url}><Download />Replay + Observation</LinkButton> : null}
-              {activeGame?.visualizer_url ? <CopyButton getValue={() => absoluteUrl(activeGame.visualizer_url!)} /> : null}
               {activeGame && !activeGame.replay_available ? <Badge variant="outline" className="bg-stone-100 text-stone-700">Replay保存期限切れ</Badge> : null}
             </div>
           </div>
@@ -1249,19 +1329,19 @@ function RankingPage() {
       <section className="rounded-lg border border-sky-200 bg-sky-50 p-4 text-sky-950">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h1 className="flex items-center gap-2 text-lg font-bold"><Trophy className="size-5 text-amber-600" />Eloランキング（強い順）</h1>
-            <p className="mt-1 max-w-3xl text-sm">総当たり戦の結果から計算した強さの順位です。Eloが高いほど、他のエージェントに安定して勝っていることを表します。</p>
+            <h1 className="flex items-center gap-2 text-lg font-bold"><Trophy className="size-5 text-amber-600" />{tournament ? `${tournament.name} ランキング` : "通常ランキング"}</h1>
+            <p className="mt-1 max-w-3xl text-sm">{tournament ? "このシーズン内だけの対戦結果を600から計算したランキングです。" : "すべてのシーズンを通して継続する総合Eloランキングです。"}</p>
           </div>
-          <LinkButton href="/management"><Settings />総当たり大会管理</LinkButton>
+          <div className="flex flex-wrap gap-2">{tournament ? <LinkButton href="/ranking"><Trophy />通常ランキング</LinkButton> : null}<LinkButton href="/management"><Settings />シーズン一覧</LinkButton></div>
         </div>
         <div className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-xs">
-          <span><b>集計範囲：</b>{tournament ? `大会「${tournament.name}」のみ` : "通常の総当たり戦（全期間）"}</span>
+          <span><b>集計範囲：</b>{tournament ? `シーズン「${tournament.name}」のみ` : "通常対戦（全期間）"}</span>
           <span><b>並び順：</b>Eloの高い順</span>
           <span><b>初期Elo：</b>{elo.initial}</span>
           <span><b>更新係数：</b>K={elo.k}</span>
         </div>
       </section>
-      <Panel title={tournament?.name || "総合ランキング"}>
+      <Panel title={tournament ? `${tournament.name}・シーズンランキング` : "通常ランキング（全シーズン継続）"}>
         <RankingTable agents={rows} tournamentId={tournament?.id} pageSize={10} />
       </Panel>
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -1409,10 +1489,11 @@ function RunDetail({ id }: { id: string }) {
       enableSorting: false,
       cell: ({ row }) => {
         const replayIndex = games.findIndex((game) => game.game === row.original.game)
-        return <div className="flex flex-wrap gap-2"><VisualizerActions items={replayItems} index={Math.max(0, replayIndex)} /><LinkButton href={row.original.download_url}><Download />Replay + Observation</LinkButton></div>
+        const runId = run?.run_id || id
+        return <div className="flex flex-wrap gap-2"><VisualizerActions items={replayItems} index={Math.max(0, replayIndex)} /><LinkButton href={`/api/replays/${encodeURIComponent(runId)}/games/${row.original.game}/json`} external><Eye />JSON</LinkButton><LinkButton href={`/api/replays/${encodeURIComponent(runId)}/games/${row.original.game}/raw`} external>Raw</LinkButton><LinkButton href={`/api/replays/${encodeURIComponent(runId)}/games/${row.original.game}/json?download=1`}><Download />保存</LinkButton></div>
       },
     },
-  ], [games, replayItems])
+  ], [games, id, replayItems, run?.run_id])
   if (!run) return <Loading />
   return (
     <div className="grid gap-5">
@@ -1423,7 +1504,7 @@ function RunDetail({ id }: { id: string }) {
           <div className={`flex w-fit items-center gap-2 rounded-md px-3 py-2 font-bold ${runWinnerName(run) === "引き分け" ? "bg-stone-100" : "bg-amber-100 text-amber-950"}`}><Trophy className="size-4" />{runWinnerName(run) === "引き分け" ? "対戦結果：引き分け" : `対戦勝者：${runWinnerName(run)}`}</div>
           <div>成績（{run.agent0_name}勝 - {run.agent1_name}勝 - 引き分け）: <b>{runResultLabel(run)}</b></div>
           <div>replay: <code className="text-xs">{run.replay_rel}</code></div>
-          {run.download_url ? <div><LinkButton href={run.download_url}><Download />全ゲーム replay JSONL</LinkButton></div> : null}
+          {run.download_url ? <div className="flex flex-wrap gap-2"><LinkButton href={`/api/replays/${encodeURIComponent(run.run_id)}/manifest`} external><Eye />Manifest</LinkButton><LinkButton href={`/api/replays/${encodeURIComponent(run.run_id)}/raw`} external>Raw JSONL</LinkButton><LinkButton href={`/api/replays/${encodeURIComponent(run.run_id)}/raw?download=1`}><Download />JSONL保存</LinkButton></div> : null}
           {!run.replay_available ? <div className="rounded-md border border-stone-300 bg-stone-100 px-3 py-2 text-stone-700">Replay保存期限切れ：{run.replay_unavailable_reason}</div> : null}
         </div>
       </Panel>
@@ -1439,6 +1520,98 @@ function Loading({ error }: { error?: string }) {
     <Card>
       <CardContent className="text-sm text-muted-foreground">{error || "Loading..."}</CardContent>
     </Card>
+  )
+}
+
+function GlobalAgentDropzone({ onUploaded }: { onUploaded: (path: string) => void }) {
+  const dragDepth = useRef(0)
+  const [dragging, setDragging] = useState(false)
+  const [file, setFile] = useState<File | null>(null)
+  const [open, setOpen] = useState(false)
+  const [name, setName] = useState("")
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    const hasFiles = (event: DragEvent) => Array.from(event.dataTransfer?.types || []).includes("Files")
+    const onDragEnter = (event: DragEvent) => {
+      if (!hasFiles(event)) return
+      event.preventDefault()
+      dragDepth.current += 1
+      setDragging(true)
+    }
+    const onDragOver = (event: DragEvent) => {
+      if (!hasFiles(event)) return
+      event.preventDefault()
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy"
+    }
+    const onDragLeave = (event: DragEvent) => {
+      if (!hasFiles(event)) return
+      event.preventDefault()
+      dragDepth.current = Math.max(0, dragDepth.current - 1)
+      if (!dragDepth.current) setDragging(false)
+    }
+    const onDrop = (event: DragEvent) => {
+      if (!hasFiles(event)) return
+      event.preventDefault()
+      dragDepth.current = 0
+      setDragging(false)
+      const dropped = Array.from(event.dataTransfer?.files || []).find((item) => /\.(tar\.gz|tgz)$/i.test(item.name))
+      if (!dropped) {
+        toast.error("アップロードできません", { description: "submission.tar.gz または .tgz をドロップしてください。" })
+        return
+      }
+      setFile(dropped)
+      setName("")
+      setOpen(true)
+    }
+    window.addEventListener("dragenter", onDragEnter)
+    window.addEventListener("dragover", onDragOver)
+    window.addEventListener("dragleave", onDragLeave)
+    window.addEventListener("drop", onDrop)
+    return () => {
+      window.removeEventListener("dragenter", onDragEnter)
+      window.removeEventListener("dragover", onDragOver)
+      window.removeEventListener("dragleave", onDragLeave)
+      window.removeEventListener("drop", onDrop)
+    }
+  }, [])
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault()
+    if (!file) return
+    setBusy(true)
+    const formData = new FormData()
+    formData.append("submission", file)
+    if (name.trim()) formData.append("name", name.trim())
+    formData.append("max_steps", "2000")
+    try {
+      const data = await api<{ message: string; redirect?: string }>("/api/agents/upload", { method: "POST", body: formData })
+      toast.success("Agentを受け付けました", { description: data.message })
+      setOpen(false)
+      setFile(null)
+      onUploaded(data.redirect || "/agents")
+    } catch (error) {
+      toast.error("Agentをアップロードできませんでした", { description: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <>
+      {dragging ? <div className="pointer-events-none fixed inset-0 z-[100] grid place-items-center bg-sky-950/75 p-6 backdrop-blur-sm"><div className="grid w-full max-w-xl place-items-center gap-4 rounded-3xl border-2 border-dashed border-white bg-sky-600/30 px-8 py-20 text-center text-white shadow-2xl"><div className="grid size-20 place-items-center rounded-full bg-white/15"><Upload className="size-10" /></div><div><div className="text-2xl font-bold">ここにAgentをドロップ</div><div className="mt-2 text-sm text-sky-100">submission.tar.gz / .tgz</div></div></div></div> : null}
+      <Dialog open={open} onOpenChange={(next) => { setOpen(next); if (!next && !busy) setFile(null) }}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader><DialogTitle>Agentを提出</DialogTitle><DialogDescription>ファイルを受け付けました。Agent名は省略できます。</DialogDescription></DialogHeader>
+          <form className="grid gap-4" onSubmit={submit}>
+            <div className="flex items-center gap-3 rounded-lg border bg-muted/40 p-3"><Upload className="size-5 shrink-0" /><div className="min-w-0"><div className="truncate font-medium">{file?.name}</div><div className="text-xs text-muted-foreground">{file ? `${(file.size / 1024 / 1024).toFixed(2)} MB` : ""}</div></div></div>
+            <Field label="Agent名（オプション）"><Input value={name} onChange={(event) => setName(event.target.value)} placeholder="未入力の場合はファイル名を使用" autoFocus /></Field>
+            <div className="rounded-md bg-sky-50 px-3 py-2 text-xs text-sky-950">提出後にSelf Checkを実行し、合格すると最新シーズンへ追加されます。</div>
+            <div className="flex justify-end gap-2"><Button type="button" variant="outline" disabled={busy} onClick={() => setOpen(false)}>キャンセル</Button><Button disabled={busy || !file}>{busy ? "送信中…" : "Agentを提出"}</Button></div>
+          </form>
+        </DialogContent>
+      </Dialog>
+    </>
   )
 }
 
@@ -1468,6 +1641,7 @@ export function App() {
 
   return (
     <TooltipProvider>
+      <GlobalAgentDropzone onUploaded={navigate} />
       <Toaster richColors position="top-right" />
       <div className="min-h-svh bg-stone-50 text-foreground">
         <header className="sticky top-0 z-10 border-b bg-background/95 backdrop-blur">

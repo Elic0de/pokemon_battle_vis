@@ -33,6 +33,30 @@ python app.py
 http://127.0.0.1:5000
 ```
 
+## Cloudflare Tunnelで公開
+
+Cloudflare Zero TrustでNamed Tunnelを作成し、Public HostnameのServiceを
+`http://127.0.0.1:5173` に設定します。AgentはPythonコードとして実行されるため、
+Public HostnameにはCloudflare Access認証を必ず設定してください。
+
+cloudflaredをDocker Desktop/WSL上のコンテナで動かす場合は、コンテナ内の
+localhostではなくServiceを `http://host.docker.internal:5173` に設定します。
+
+Flask APIとViteを起動した後、Tunnel tokenをリポジトリに保存せず環境変数で渡します。
+
+```bash
+export CLOUDFLARE_TUNNEL_TOKEN='Cloudflareのtoken'
+./tools/cloudflare_tunnel.sh
+```
+
+tokenをコマンド履歴へ残したくない場合:
+
+```bash
+read -rsp 'Cloudflare Tunnel token: ' CLOUDFLARE_TUNNEL_TOKEN
+export CLOUDFLARE_TUNNEL_TOKEN
+./tools/cloudflare_tunnel.sh
+```
+
 ## できること
 
 - `submission.tar.gz` / `.tgz` をブラウザからアップロード

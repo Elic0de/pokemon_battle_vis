@@ -94,18 +94,18 @@ export function GameManagement() {
   return (
     <div className="grid gap-5">
       <section className="border bg-background">
-        <div className="flex items-center gap-2 border-b px-4 py-3 font-semibold"><Settings2 className="size-4" />総当たり大会の作成</div>
-        <div className="border-b bg-sky-50 px-4 py-3 text-sm text-sky-950">開始時点のready状態の全Agentが、他の全Agentと1組ずつ対戦します。参加者がN人なら組み合わせは N×(N−1)÷2 組です。</div>
+        <div className="flex items-center gap-2 border-b px-4 py-3 font-semibold"><Settings2 className="size-4" />新しいシーズンの作成</div>
+        <div className="border-b bg-sky-50 px-4 py-3 text-sm text-sky-950">新シーズン開始時だけ現在の全Agentで総当たりを行います。以後、新しいAgentはSelf Check合格後に既存参加者との対戦だけが追加されます。</div>
         <div className="grid gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <div className="grid gap-1"><Label htmlFor="tournament-name">大会名</Label><Input id="tournament-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="総当たり大会 2026-06-29" /></div>
+            <div className="grid gap-1"><Label htmlFor="tournament-name">シーズン名</Label><Input id="tournament-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="Season 2026-07" /></div>
             <div className="grid gap-1"><Label htmlFor="tournament-games">1組あたりのゲーム数</Label><Input id="tournament-games" type="number" min={1} max={1000} value={games} onChange={(event) => setGames(Math.max(1, Number(event.target.value) || 1))} /></div>
             <div className="grid gap-1"><Label htmlFor="tournament-steps">Max steps</Label><Input id="tournament-steps" type="number" min={10} value={maxSteps} onChange={(event) => setMaxSteps(Math.max(10, Number(event.target.value) || 10))} /></div>
             <label className="flex h-8 items-center gap-2 self-end text-sm"><Checkbox checked={swap} onCheckedChange={(checked) => setSwap(checked === true)} />先後を入れ替える</label>
           </div>
           <Button type="button" disabled={busy} onClick={() => void startTournament()}>
             {busy ? <LoaderCircle className="animate-spin" /> : <Play />}
-            現在の全Agentで総当たり開始
+            新シーズンを開始
           </Button>
         </div>
         {message ? <div className="border-t px-4 py-3 text-sm text-emerald-700">{message}</div> : null}
@@ -115,13 +115,13 @@ export function GameManagement() {
       {current ? (
         <section className="border bg-background">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3">
-            <div><div className="font-semibold">{current.name}</div><div className="text-xs text-muted-foreground">総当たり大会（全Agent間の全組み合わせ）</div></div>
+            <div><div className="font-semibold">{current.name}</div><div className="text-xs text-muted-foreground">最新シーズン（新Agentは差分対戦で追加）</div></div>
             <div className="flex gap-2">
               <Button asChild variant="outline"><a href={`/ranking?tournament_id=${encodeURIComponent(current.id)}`}><Trophy />ランキング</a></Button>
               <AlertDialog>
                 <AlertDialogTrigger asChild><Button variant="destructive" disabled={busy}><RotateCcw />ランキングをリセット</Button></AlertDialogTrigger>
                 <AlertDialogContent>
-                  <AlertDialogHeader><AlertDialogTitle>{current.name} をリセットしますか？</AlertDialogTitle><AlertDialogDescription>この大会のJobs、Runs、Replay、Eloを削除し、開始時点の参加Agentで同じ大会を最初から再実行します。</AlertDialogDescription></AlertDialogHeader>
+                  <AlertDialogHeader><AlertDialogTitle>{current.name} をリセットしますか？</AlertDialogTitle><AlertDialogDescription>このシーズンのJobs、Runs、Replay、Eloを削除し、参加Agentで最初から再実行します。</AlertDialogDescription></AlertDialogHeader>
                   <AlertDialogFooter><AlertDialogCancel>キャンセル</AlertDialogCancel><AlertDialogAction variant="destructive" onClick={() => void resetCurrent()}><RotateCcw />リセットして再開</AlertDialogAction></AlertDialogFooter>
                 </AlertDialogContent>
               </AlertDialog>
@@ -137,9 +137,9 @@ export function GameManagement() {
       ) : null}
 
       <section className="border bg-background">
-        <div className="border-b px-4 py-3 font-semibold">総当たり大会の履歴</div>
+        <div className="border-b px-4 py-3 font-semibold">シーズン履歴</div>
         <Table>
-          <TableHeader><TableRow><TableHead>大会</TableHead><TableHead>状態</TableHead><TableHead>参加数</TableHead><TableHead>組み合わせ進捗</TableHead><TableHead>開始日時</TableHead><TableHead /></TableRow></TableHeader>
+          <TableHeader><TableRow><TableHead>シーズン</TableHead><TableHead>状態</TableHead><TableHead>参加数</TableHead><TableHead>組み合わせ進捗</TableHead><TableHead>開始日時</TableHead><TableHead /></TableRow></TableHeader>
           <TableBody>
             {data.tournaments.map((tournament) => (
               <TableRow key={tournament.id}>
@@ -148,10 +148,10 @@ export function GameManagement() {
                 <TableCell>{tournament.participant_count}</TableCell>
                 <TableCell>{tournament.done + tournament.failed} / {tournament.jobs}</TableCell>
                 <TableCell className="whitespace-nowrap text-xs text-muted-foreground">{dateLabel(tournament.started_at)}<div>{elapsedLabel(tournament.started_at, tournament.completed_at)}</div></TableCell>
-                <TableCell><Button asChild variant="outline" size="sm"><a href={`/ranking?tournament_id=${encodeURIComponent(tournament.id)}`}><Trophy />ランキング</a></Button></TableCell>
+                <TableCell><Button asChild variant="outline" size="sm"><a href={`/ranking?tournament_id=${encodeURIComponent(tournament.id)}`}><Trophy />ランキング詳細</a></Button></TableCell>
               </TableRow>
             ))}
-            {!data.tournaments.length ? <TableRow><TableCell colSpan={6} className="h-24 text-center text-muted-foreground">大会はまだありません</TableCell></TableRow> : null}
+            {!data.tournaments.length ? <TableRow><TableCell colSpan={6} className="h-24 text-center text-muted-foreground">シーズンはまだありません</TableCell></TableRow> : null}
           </TableBody>
         </Table>
       </section>

@@ -10,7 +10,9 @@ export default defineConfig(() => ({
     proxy: {
       "/api": process.env.VITE_API_TARGET || "http://127.0.0.1:5000",
     },
-    allowedHosts: [".ngrok-free.app"]
+    // Named Cloudflare Tunnels can use either a custom domain or a generated
+    // hostname. The tunnel still points only at this local development server.
+    allowedHosts: true as const,
   },
   resolve: {
     alias: {

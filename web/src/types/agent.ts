@@ -22,6 +22,8 @@ export type Agent = {
   download_url?: string
   tournament_id?: string
   tournament_name?: string
+  series_name?: string
+  version?: number
 }
 
 export type DeckCard = {

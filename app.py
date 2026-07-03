@@ -277,6 +277,7 @@ def init_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_tournament ON jobs(tournament_id, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_elo_games_tournament ON elo_games(tournament_id, id)")
+        conn.execute("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS deck_library (
@@ -414,6 +415,64 @@ def get_agent(agent_id: str) -> dict[str, Any] | None:
 def resolve_agent_path(agent: dict[str, Any]) -> Path:
     p = Path(str(agent["path"]))
     return p if p.is_absolute() else ROOT / p
+
+
+def agent_series_info(name: str) -> tuple[str, int]:
+    """Return the stable series label and numeric version from an Agent name."""
+    match = re.match(r"^(.*?)(?:\s+v(\d+))?$", (name or "").strip(), re.IGNORECASE)
+    if not match:
+        return name.strip(), 1
+    return (match.group(1).strip() or name.strip(), int(match.group(2) or "1"))
+
+
+def agent_version_history(agent_id: str) -> tuple[str, list[dict[str, Any]]]:
+    target = get_agent(agent_id)
+    if not target:
+        return "", []
+    series_name, _ = agent_series_info(str(target["name"]))
+    versions: list[dict[str, Any]] = []
+    with db() as conn:
+        candidates = [dict(row) for row in conn.execute("SELECT * FROM agents ORDER BY created_at ASC").fetchall()]
+        for agent in candidates:
+            candidate_series, version = agent_series_info(str(agent["name"]))
+            if candidate_series.casefold() != series_name.casefold():
+                continue
+            latest = conn.execute(
+                """
+                SELECT ta.elo,ta.games,t.id AS tournament_id,t.name AS tournament_name,t.created_at
+                FROM tournament_agents ta JOIN tournaments t ON t.id=ta.tournament_id
+                WHERE ta.agent_id=? ORDER BY t.created_at DESC LIMIT 1
+                """,
+                (agent["id"],),
+            ).fetchone()
+            best = conn.execute(
+                """
+                SELECT CASE WHEN eg.agent0_id=? THEN eg.elo0_after ELSE eg.elo1_after END AS rating,
+                       t.id AS tournament_id,t.name AS tournament_name
+                FROM elo_games eg LEFT JOIN tournaments t ON t.id=eg.tournament_id
+                WHERE eg.agent0_id=? OR eg.agent1_id=?
+                ORDER BY rating DESC LIMIT 1
+                """,
+                (agent["id"], agent["id"], agent["id"]),
+            ).fetchone()
+            current_elo = float(latest["elo"] if latest else agent.get("elo") or ELO_INITIAL)
+            peak_elo = max(current_elo, float(best["rating"]) if best and best["rating"] is not None else current_elo)
+            versions.append({
+                "agent_id": str(agent["id"]),
+                "name": str(agent["name"]),
+                "version": version,
+                "created_at": agent.get("created_at"),
+                "status": agent.get("status"),
+                "current_elo": current_elo,
+                "peak_elo": peak_elo,
+                "games": int(latest["games"] if latest else agent.get("games") or 0),
+                "latest_tournament_id": latest["tournament_id"] if latest else None,
+                "latest_tournament_name": latest["tournament_name"] if latest else None,
+                "best_tournament_id": best["tournament_id"] if best else (latest["tournament_id"] if latest else None),
+                "best_tournament_name": best["tournament_name"] if best else (latest["tournament_name"] if latest else None),
+            })
+    versions.sort(key=lambda item: (int(item["version"]), str(item.get("created_at") or "")))
+    return series_name, versions
 
 
 def job_rows(limit: int = 100) -> list[dict[str, Any]]:
@@ -610,6 +669,39 @@ def read_replay_rows(path: Path) -> list[dict[str, Any]]:
             if line:
                 rows.append(json.loads(line))
     return rows
+
+
+def find_replay_game(run_id: str, game: int) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    run = find_run(run_id)
+    if not run:
+        return None
+    row = next((item for item in read_replay_rows(replay_path(run)) if int(item.get("game", -1)) == game), None)
+    return (run, row) if row is not None else None
+
+
+def game_replay_export(run: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    visualize = row.get("visualize_data")
+    if isinstance(visualize, str):
+        try:
+            observations = json.loads(visualize)
+        except json.JSONDecodeError:
+            observations = visualize
+    else:
+        observations = visualize if visualize is not None else row.get("visualize")
+    game_data = {key: value for key, value in row.items() if key not in {"visualize_data", "visualize"}}
+    return {
+        "format": "friend-battle-game-replay",
+        "version": 2,
+        "run": {
+            "run_id": run.get("run_id"),
+            "agent0_name": run.get("agent0_name"),
+            "agent1_name": run.get("agent1_name"),
+            "started_at": run.get("started_at"),
+        },
+        "game": game_data,
+        "observations": observations,
+        "observation_count": len(observations) if isinstance(observations, list) else 0,
+    }
 
 
 def prune_tournament_replays(keep: int = TOURNAMENT_REPLAY_RETENTION) -> dict[str, int]:
@@ -934,6 +1026,47 @@ def rebuild_all_ratings(conn: sqlite3.Connection) -> None:
         update_agent_rating_stats(conn, agent1_id, elo1_after, score1, was_first=(first_agent_id == agent1_id) if first_agent_id else None)
 
 
+def rebuild_global_ratings_from_all_games() -> None:
+    """Build the persistent ranking from every season without altering season Elo."""
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE agents SET elo=?,games=0,wins=0,losses=0,draws=0,
+              first_games=0,first_wins=0,second_games=0,second_wins=0,updated_at=?
+            """,
+            (ELO_INITIAL, now_iso()),
+        )
+        for row in conn.execute("SELECT * FROM elo_games ORDER BY id ASC").fetchall():
+            agent0_id, agent1_id = str(row["agent0_id"]), str(row["agent1_id"])
+            a0 = conn.execute("SELECT elo FROM agents WHERE id=?", (agent0_id,)).fetchone()
+            a1 = conn.execute("SELECT elo FROM agents WHERE id=?", (agent1_id,)).fetchone()
+            if not a0 or not a1:
+                continue
+            elo0, elo1 = float(a0["elo"]), float(a1["elo"])
+            if row["draw"]:
+                score0, score1 = 0.5, 0.5
+            elif str(row["winner_agent_id"]) == agent0_id:
+                score0, score1 = 1.0, 0.0
+            else:
+                score0, score1 = 0.0, 1.0
+            next0 = elo0 + ELO_K * (score0 - expected_score(elo0, elo1))
+            next1 = elo1 + ELO_K * (score1 - expected_score(elo1, elo0))
+            first_agent_id = row["first_agent_id"]
+            update_agent_rating_stats(conn, agent0_id, next0, score0, was_first=(first_agent_id == agent0_id) if first_agent_id else None)
+            update_agent_rating_stats(conn, agent1_id, next1, score1, was_first=(first_agent_id == agent1_id) if first_agent_id else None)
+        conn.execute(
+            "INSERT INTO app_meta(key,value) VALUES('global_rating_scope','all_seasons_v1') ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        )
+
+
+def ensure_global_rating_scope() -> None:
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_meta WHERE key='global_rating_scope'").fetchone()
+    if not row or row["value"] != "all_seasons_v1":
+        rebuild_global_ratings_from_all_games()
+
+
 def remove_run_artifacts_for_agent(agent: dict[str, Any]) -> int:
     target = resolve_agent_path(agent).resolve()
     removed: list[dict[str, Any]] = []
@@ -1052,6 +1185,14 @@ def apply_elo_from_replay(job: dict[str, Any], replay_file: Path) -> dict[str, A
             if tournament_id:
                 update_tournament_rating_stats(conn, tournament_id, agent0_id, elo0_after, score0, was_first=(first_agent_id == agent0_id) if first_agent_id else None)
                 update_tournament_rating_stats(conn, tournament_id, agent1_id, elo1_after, score1, was_first=(first_agent_id == agent1_id) if first_agent_id else None)
+                global0 = conn.execute("SELECT elo FROM agents WHERE id=?", (agent0_id,)).fetchone()
+                global1 = conn.execute("SELECT elo FROM agents WHERE id=?", (agent1_id,)).fetchone()
+                if global0 and global1:
+                    global_elo0, global_elo1 = float(global0["elo"]), float(global1["elo"])
+                    global_after0 = global_elo0 + ELO_K * (score0 - expected_score(global_elo0, global_elo1))
+                    global_after1 = global_elo1 + ELO_K * (score1 - expected_score(global_elo1, global_elo0))
+                    update_agent_rating_stats(conn, agent0_id, global_after0, score0, was_first=(first_agent_id == agent0_id) if first_agent_id else None)
+                    update_agent_rating_stats(conn, agent1_id, global_after1, score1, was_first=(first_agent_id == agent1_id) if first_agent_id else None)
             else:
                 update_agent_rating_stats(conn, agent0_id, elo0_after, score0, was_first=(first_agent_id == agent0_id) if first_agent_id else None)
                 update_agent_rating_stats(conn, agent1_id, elo1_after, score1, was_first=(first_agent_id == agent1_id) if first_agent_id else None)
@@ -1087,8 +1228,6 @@ def last_record(agent_id: str, limit: int = 20, tournament_id: str | None = None
         if tournament_id:
             sql = sql.replace("WHERE agent0_id=? OR agent1_id=?", "WHERE (agent0_id=? OR agent1_id=?) AND tournament_id=?")
             params.append(tournament_id)
-        else:
-            sql = sql.replace("WHERE agent0_id=? OR agent1_id=?", "WHERE (agent0_id=? OR agent1_id=?) AND tournament_id IS NULL")
         sql += " ORDER BY id DESC LIMIT ?"
         params.append(limit)
         rows = conn.execute(sql, params).fetchall()
@@ -1169,13 +1308,67 @@ def api_tournament_agent_row(agent: dict[str, Any], tournament_id: str) -> dict[
     return out
 
 
+def enroll_agent_in_latest_season(agent_id: str) -> tuple[str | None, list[str]]:
+    """Add a newly validated Agent to the latest season and schedule only new pairings."""
+    agent = get_agent(agent_id)
+    if not agent or agent.get("status") != "ready":
+        return None, []
+    with db() as conn:
+        season = conn.execute("SELECT * FROM tournaments ORDER BY created_at DESC, id DESC LIMIT 1").fetchone()
+        if not season:
+            return None, []
+        season_id = str(season["id"])
+        exists = conn.execute(
+            "SELECT 1 FROM tournament_agents WHERE tournament_id=? AND agent_id=?",
+            (season_id, agent_id),
+        ).fetchone()
+        if exists:
+            return season_id, []
+        opponents = [str(row["agent_id"]) for row in conn.execute(
+            "SELECT agent_id FROM tournament_agents WHERE tournament_id=? ORDER BY seed",
+            (season_id,),
+        ).fetchall()]
+        seed = int(conn.execute(
+            "SELECT COALESCE(MAX(seed),0)+1 FROM tournament_agents WHERE tournament_id=?",
+            (season_id,),
+        ).fetchone()[0])
+        conn.execute(
+            """
+            INSERT INTO tournament_agents(tournament_id,agent_id,name,source,path,seed,elo)
+            VALUES(?,?,?,?,?,?,?)
+            """,
+            (season_id, agent_id, agent["name"], agent.get("source"), agent.get("path"), seed, ELO_INITIAL),
+        )
+        conn.execute(
+            """
+            UPDATE tournaments
+            SET participant_count=(SELECT COUNT(*) FROM tournament_agents WHERE tournament_id=?),
+                status='running',completed_at=NULL
+            WHERE id=?
+            """,
+            (season_id, season_id),
+        )
+        games = int(season["games_per_match"])
+        max_steps = int(season["max_steps"])
+        swap = bool(season["swap"])
+    job_ids = [
+        job_id
+        for opponent_id in opponents
+        if (job_id := enqueue_job(
+            agent_id, opponent_id, games, max_steps, swap,
+            job_type=JOB_TYPE_AUTO, dedupe_running=False, tournament_id=season_id,
+        ))
+    ]
+    return season_id, job_ids
+
+
 def create_and_start_tournament(name: str, games: int, max_steps: int = DEFAULT_MAX_STEPS, swap: bool = True) -> tuple[dict[str, Any], list[str]]:
     agents = agent_rows(only_ready=True)
     if len(agents) < 2:
         raise ValueError("大会にはready状態のAgentが2件以上必要です。")
     tournament_id = "tournament-" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     started_at = now_iso()
-    display_name = name.strip() or datetime.now().strftime("総当たり大会 %Y-%m-%d %H:%M")
+    display_name = name.strip() or datetime.now().strftime("シーズン %Y-%m-%d %H:%M")
     with db() as conn:
         conn.execute(
             """
@@ -1268,6 +1461,12 @@ def update_job(job_id: str, **fields: Any) -> None:
         conn.execute(sql, values)
 
 
+def process_error_summary(stderr: str, returncode: int) -> str:
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    cause = lines[-1] if lines else "詳細はstderrを確認してください"
+    return f"friend_battle.py exited with {returncode}: {cause}"[:2000]
+
+
 def run_job(job: dict[str, Any]) -> None:
     a0 = get_agent(job["agent0_id"])
     a1 = get_agent(job["agent1_id"])
@@ -1302,7 +1501,7 @@ def run_job(job: dict[str, Any]) -> None:
     try:
         proc = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, timeout=timeout)
         if proc.returncode != 0:
-            error_msg = f"friend_battle.py exited with {proc.returncode}"
+            error_msg = process_error_summary(proc.stderr, proc.returncode)
             if job_type == JOB_TYPE_SELF_CHECK:
                 canceled = mark_agent_failed(str(job["agent0_id"]), error_msg)
                 error_msg += f"; agent disabled; canceled queued jobs={canceled}"
@@ -1322,6 +1521,9 @@ def run_job(job: dict[str, Any]) -> None:
             summary["self_check"] = "passed" if passed else "failed"
             if passed:
                 mark_agent_self_check_passed(str(job["agent0_id"]))
+                season_id, season_jobs = enroll_agent_in_latest_season(str(job["agent0_id"]))
+                summary["season_id"] = season_id
+                summary["season_jobs"] = len(season_jobs)
             else:
                 canceled = mark_agent_failed(str(job["agent0_id"]), self_error or "self-check failed")
                 summary["self_check_error"] = self_error
@@ -1694,21 +1896,10 @@ def api_config():
 
 @app.get("/api/dashboard")
 def api_dashboard():
-    current_tournament = latest_tournament()
-    tournament_rank = tournament_ranking_rows(current_tournament["id"]) if current_tournament else []
-    tournament_by_id = {str(row["id"]): row for row in tournament_rank}
-    agents_ready = []
-    for agent in agent_rows(only_ready=True):
-        item = api_agent_row(agent)
-        snapshot = tournament_by_id.get(str(agent["id"]))
-        if snapshot:
-            tournament_item = api_tournament_agent_row(snapshot, current_tournament["id"])
-            for key in ("elo", "games", "wins", "losses", "draws", "first_games", "first_wins", "second_games", "second_wins", "last_record"):
-                item[key] = tournament_item[key]
-        agents_ready.append(item)
+    agents_ready = [api_agent_row(agent) for agent in agent_rows(only_ready=True)]
     jobs_list = [api_job_row(j) for j in job_rows(limit=8)]
     runs_list = [api_run_row(r) for r in iter_runs()[:5]]
-    top_rank = [api_tournament_agent_row(a, current_tournament["id"]) for a in tournament_rank[:5]] if current_tournament else [api_agent_row(a) for a in ranking_rows()[:5]]
+    top_rank = [api_agent_row(a) for a in ranking_rows()[:5]]
     return jsonify({
         "metrics": {
             "agents": len(agents_ready),
@@ -1730,24 +1921,13 @@ def api_dashboard():
         "jobs": jobs_list,
         "runs": runs_list,
         "ranking": top_rank,
-        "tournament": current_tournament,
+        "tournament": None,
     })
 
 
 @app.get("/api/agents")
 def api_agents():
     rows = [api_agent_row(a, include_checks=True) for a in agent_rows(only_ready=False)]
-    current_tournament = latest_tournament()
-    if current_tournament:
-        tournament_by_id = {str(item["id"]): item for item in tournament_ranking_rows(current_tournament["id"])}
-        for row in rows:
-            snapshot = tournament_by_id.get(str(row["id"]))
-            if snapshot:
-                tournament_item = api_tournament_agent_row(snapshot, current_tournament["id"])
-                for key in ("elo", "games", "wins", "losses", "draws", "first_games", "first_wins", "second_games", "second_wins", "last_record"):
-                    row[key] = tournament_item[key]
-                row["tournament_id"] = current_tournament["id"]
-                row["tournament_name"] = current_tournament["name"]
     ready = [a for a in rows if a.get("status") == "ready"]
     return jsonify({"agents": rows, "ready_agents": ready})
 
@@ -1807,6 +1987,7 @@ def api_agent_detail(agent_id: str):
             } if replay_availability[run_id] and run else {}
         replay_game = replay_games[run_id].get(int(row["game_index"]), {})
         is_agent0 = row["agent0_id"] == agent_id
+        opponent_id = str(row["agent1_id"] if is_agent0 else row["agent0_id"])
         opponent_name = row["agent1_name"] if is_agent0 else row["agent0_name"]
         result = "draw" if row["draw"] else "win" if row["winner_agent_id"] == agent_id else "loss"
         seat = "first" if row["first_agent_id"] == agent_id else "second" if row["second_agent_id"] == agent_id else "-"
@@ -1814,6 +1995,7 @@ def api_agent_detail(agent_id: str):
             "run_id": row["run_id"],
             "game_index": row["game_index"],
             "opponent_name": opponent_name,
+            "opponent_id": opponent_id,
             "result": result,
             "seat": seat,
             "steps": row["steps"],
@@ -1839,7 +2021,8 @@ def api_agent_detail(agent_id: str):
         for key in ("elo", "games", "wins", "losses", "draws", "first_games", "first_wins", "second_games", "second_wins"):
             agent_out[key] = tournament_agent[key]
     tournament = next((row for row in tournament_rows() if row["id"] == tournament_id), None)
-    return jsonify({"agent": agent_out, "history": history, "tournament": tournament})
+    series_name, versions = agent_version_history(agent_id)
+    return jsonify({"agent": agent_out, "history": history, "tournament": tournament, "series_name": series_name, "versions": versions})
 
 
 @app.get("/api/agents/<path:agent_id>/meta")
@@ -2099,9 +2282,6 @@ def api_delete_agent(agent_id: str):
 @app.get("/api/ranking")
 def api_ranking():
     tournament_id = (request.args.get("tournament_id") or "").strip()
-    if not tournament_id and request.args.get("scope") != "open":
-        latest = latest_tournament()
-        tournament_id = str(latest["id"]) if latest else ""
     tournament = next((row for row in tournament_rows() if row["id"] == tournament_id), None) if tournament_id else None
     agents = [api_tournament_agent_row(a, tournament["id"]) for a in tournament_ranking_rows(tournament["id"])] if tournament else [api_agent_row(a) for a in ranking_rows()]
     return jsonify({"agents": agents, "tournament": tournament, "elo": {"initial": ELO_INITIAL, "k": ELO_K}})
@@ -2110,17 +2290,17 @@ def api_ranking():
 @app.get("/api/win-rate-matrix")
 def api_win_rate_matrix():
     tournament_id = (request.args.get("tournament_id") or "").strip()
-    if not tournament_id:
-        tournament = latest_tournament()
-        tournament_id = str(tournament["id"]) if tournament else ""
     agents = tournament_ranking_rows(tournament_id) if tournament_id else ranking_rows()
     agent_ids = [str(agent["id"]) for agent in agents]
     cells: dict[str, dict[str, dict[str, Any]]] = {agent_id: {} for agent_id in agent_ids}
     with db() as conn:
-        rows = conn.execute(
-            "SELECT agent0_id,agent1_id,winner_agent_id,draw FROM elo_games WHERE tournament_id=? ORDER BY id",
-            (tournament_id,),
-        ).fetchall() if tournament_id else []
+        if tournament_id:
+            rows = conn.execute(
+                "SELECT agent0_id,agent1_id,winner_agent_id,draw FROM elo_games WHERE tournament_id=? ORDER BY id",
+                (tournament_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT agent0_id,agent1_id,winner_agent_id,draw FROM elo_games ORDER BY id").fetchall()
     for row in rows:
         left, right = str(row["agent0_id"]), str(row["agent1_id"])
         for agent_id, opponent_id in ((left, right), (right, left)):
@@ -2271,6 +2451,9 @@ def api_job_result(job: dict[str, Any]) -> dict[str, Any] | None:
 
 def api_agent_row(agent: dict[str, Any], *, include_checks: bool = False) -> dict[str, Any]:
     out = dict(agent)
+    series_name, version = agent_series_info(str(agent.get("name") or ""))
+    out["series_name"] = series_name
+    out["version"] = version
     out["short_id"] = str(agent.get("id", ""))[:16]
     out["elo"] = float(agent.get("elo") or ELO_INITIAL)
     out["games"] = int(agent.get("games") or 0)
@@ -2529,40 +2712,154 @@ def download_replay(run_id: str):
 
 @app.get("/api/runs/<run_id>/games/<int:game>/download")
 def download_game_replay(run_id: str, game: int):
-    run = find_run(run_id)
-    if not run:
-        return jsonify({"error": "run not found"}), 404
-    row = next((item for item in read_replay_rows(replay_path(run)) if int(item.get("game", -1)) == game), None)
-    if row is None:
+    found = find_replay_game(run_id, game)
+    if not found:
         return jsonify({"error": "game not found"}), 404
-
-    visualize = row.get("visualize_data")
-    if isinstance(visualize, str):
-        try:
-            observations = json.loads(visualize)
-        except json.JSONDecodeError:
-            observations = visualize
-    else:
-        observations = visualize if visualize is not None else row.get("visualize")
-
-    game_data = {key: value for key, value in row.items() if key not in {"visualize_data", "visualize"}}
-    export = {
-        "format": "friend-battle-game-replay",
-        "version": 1,
-        "run": {
-            "run_id": run_id,
-            "agent0_name": run.get("agent0_name"),
-            "agent1_name": run.get("agent1_name"),
-            "started_at": run.get("started_at"),
-        },
-        "game": game_data,
-        "observations": observations,
-        "observation_count": len(observations) if isinstance(observations, list) else 0,
-    }
+    run, row = found
+    export = game_replay_export(run, row)
     filename = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', run_id)}-game-{game}.json"
     response = Response(json.dumps(export, ensure_ascii=False, indent=2), mimetype="application/json")
     response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
     return response
+
+
+@app.get("/api/replays")
+def api_replay_list():
+    limit = max(1, min(int(request.args.get("limit", "100")), 1000))
+    return jsonify({"replays": [api_run_row(run) for run in iter_runs()[:limit]], "limit": limit})
+
+
+@app.get("/api/replays/<run_id>/manifest")
+def api_replay_manifest(run_id: str):
+    run = find_run(run_id)
+    if not run:
+        return jsonify({"error": "run not found"}), 404
+    path = replay_path(run)
+    rows = read_replay_rows(path)
+    games = []
+    for row in rows:
+        visualize = row.get("visualize_data") or row.get("visualize")
+        observation_count = 0
+        if isinstance(visualize, str):
+            try:
+                parsed = json.loads(visualize)
+                observation_count = len(parsed) if isinstance(parsed, list) else 0
+            except json.JSONDecodeError:
+                pass
+        elif isinstance(visualize, list):
+            observation_count = len(visualize)
+        game = int(row.get("game", 0))
+        games.append({
+            "game": game,
+            "winner": row.get("winner"),
+            "steps": row.get("steps"),
+            "reason": row.get("reason"),
+            "action_count": len(row.get("actions") or []),
+            "observation_count": observation_count,
+            "json_url": f"/api/replays/{run_id}/games/{game}/json",
+            "raw_url": f"/api/replays/{run_id}/games/{game}/raw",
+            "download_url": f"/api/replays/{run_id}/games/{game}/json?download=1",
+        })
+    return jsonify({
+        "run": api_run_row(run),
+        "replay_available": path.is_file(),
+        "size_bytes": path.stat().st_size if path.is_file() else 0,
+        "games": games,
+        "raw_jsonl_url": f"/api/replays/{run_id}/raw",
+        "raw_jsonl_download_url": f"/api/replays/{run_id}/raw?download=1",
+    })
+
+
+@app.get("/api/replays/<run_id>/games/<int:game>/json")
+def api_replay_game_json(run_id: str, game: int):
+    found = find_replay_game(run_id, game)
+    if not found:
+        return jsonify({"error": "game not found"}), 404
+    run, row = found
+    body = json.dumps(game_replay_export(run, row), ensure_ascii=False, indent=2)
+    response = Response(body, mimetype="application/json")
+    if request.args.get("download") == "1":
+        response.headers["Content-Disposition"] = f'attachment; filename="{run_id}-game-{game}.json"'
+    return response
+
+
+@app.get("/api/replays/<run_id>/games/<int:game>/raw")
+def api_replay_game_raw(run_id: str, game: int):
+    found = find_replay_game(run_id, game)
+    if not found:
+        return jsonify({"error": "game not found"}), 404
+    _, row = found
+    response = Response(json.dumps(row, ensure_ascii=False, indent=2), mimetype="application/json")
+    if request.args.get("download") == "1":
+        response.headers["Content-Disposition"] = f'attachment; filename="{run_id}-game-{game}-raw.json"'
+    return response
+
+
+@app.get("/api/replays/<run_id>/raw")
+def api_replay_raw_jsonl(run_id: str):
+    run = find_run(run_id)
+    if not run or not replay_path(run).is_file():
+        return Response("replay not found", status=404)
+    response = send_file(replay_path(run), mimetype="application/x-ndjson", as_attachment=request.args.get("download") == "1")
+    if request.args.get("download") == "1":
+        response.headers["Content-Disposition"] = f'attachment; filename="{run_id}.jsonl"'
+    return response
+
+
+def directory_size(path: Path) -> int:
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file()) if path.exists() else 0
+
+
+@app.get("/api/diagnostics")
+def api_diagnostics():
+    with db() as conn:
+        job_counts = {str(row["status"]): int(row["count"]) for row in conn.execute("SELECT status,COUNT(*) AS count FROM jobs GROUP BY status").fetchall()}
+        recent_failures = [dict(row) for row in conn.execute(
+            """
+            SELECT j.id,j.job_type,j.error,j.stderr,j.finished_at,a0.name AS agent0_name,a1.name AS agent1_name
+            FROM jobs j JOIN agents a0 ON a0.id=j.agent0_id JOIN agents a1 ON a1.id=j.agent1_id
+            WHERE j.status='failed' ORDER BY COALESCE(j.finished_at,j.created_at) DESC LIMIT 10
+            """
+        ).fetchall()]
+        agent_counts = {str(row["status"]): int(row["count"]) for row in conn.execute("SELECT status,COUNT(*) AS count FROM agents GROUP BY status").fetchall()}
+    season = latest_tournament()
+    return jsonify({
+        "generated_at": now_iso(),
+        "agents": {"counts": agent_counts, "list_url": "/api/agents"},
+        "jobs": {"counts": job_counts, "list_url": "/api/jobs"},
+        "latest_season": season,
+        "replays": {
+            "retained_seasons": TOURNAMENT_REPLAY_RETENTION,
+            "list_url": "/api/replays",
+            "size_bytes": directory_size(REPLAYS_DIR),
+        },
+        "storage": {
+            "database_bytes": DB_PATH.stat().st_size if DB_PATH.exists() else 0,
+            "agents_bytes": directory_size(AGENTS_DIR),
+            "uploads_bytes": directory_size(UPLOADS_DIR),
+            "replays_bytes": directory_size(REPLAYS_DIR),
+        },
+        "recent_failures": recent_failures,
+        "api_index_url": "/api/endpoints",
+    })
+
+
+@app.get("/api/endpoints")
+def api_endpoints():
+    return jsonify({"endpoints": [
+        {"method": "GET", "path": "/api/diagnostics", "description": "状態、容量、直近エラー"},
+        {"method": "GET", "path": "/api/agents", "description": "Agent一覧"},
+        {"method": "GET", "path": "/api/agents/{agent_id}", "description": "Agent成績と履歴"},
+        {"method": "GET", "path": "/api/ranking", "description": "通常ランキング"},
+        {"method": "GET", "path": "/api/ranking?tournament_id={season_id}", "description": "シーズン別ランキング"},
+        {"method": "GET", "path": "/api/tournaments", "description": "シーズン一覧"},
+        {"method": "GET", "path": "/api/jobs", "description": "Job一覧"},
+        {"method": "GET", "path": "/api/replays?limit=100", "description": "Replay一覧"},
+        {"method": "GET", "path": "/api/replays/{run_id}/manifest", "description": "Replay manifest"},
+        {"method": "GET", "path": "/api/replays/{run_id}/games/{game}/json", "description": "整形JSON表示。?download=1で保存"},
+        {"method": "GET", "path": "/api/replays/{run_id}/games/{game}/raw", "description": "元row表示。?download=1で保存"},
+        {"method": "GET", "path": "/api/replays/{run_id}/raw", "description": "JSONL表示。?download=1で保存"},
+    ]})
 
 
 def visualizer_payload_from_row(row: dict[str, Any]) -> str:
@@ -2644,6 +2941,7 @@ def payload(run_id: str, game: int):
 
 init_db()
 sync_agent_registry()
+ensure_global_rating_scope()
 prune_tournament_replays()
 
 
